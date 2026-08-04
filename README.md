@@ -31,6 +31,7 @@ Pipelines de CI/CD, containers, orquestração, infraestrutura como código, obs
 - [triar-pods-kubernetes](./devops/triar-pods-kubernetes/) — Analisa um snapshot de cluster Kubernetes (pods, eventos, logs) e entrega diagnóstico priorizado com ações para SRE de plantão.
 - [gerar-nota-triagem-incidente](./devops/gerar-nota-triagem-incidente/) — Transforma um alerta de monitoramento em uma nota de triagem de cinco campos (alerta, impacto, hipótese, ação, escalação) para abrir incidentes de plantão.
 - [investigar-causa-raiz-elasticsearch](./devops/investigar-causa-raiz-elasticsearch/) — Conduz uma RCA passo a passo (CoT) sobre degradação de latência de busca em um cluster Elasticsearch, cruzando config, métricas e logs para apontar causa-raiz, sintomas e ações.
+- [decidir-estrategia-backpressure-relay](./devops/decidir-estrategia-backpressure-relay/) — Conduz uma análise Tree-of-Thoughts em seis rodadas para decidir a estratégia de backpressure (throttle, desvio, buffer ou descarte) de um pipeline de ingestão de telemetria, com árvore de opções, matriz de critérios ponderados, teste adversarial e recomendação final acionável.
 
 ### [Produtividade](./produtividade/)
 
