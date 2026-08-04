@@ -21,4 +21,4 @@ Entram aqui prompts relacionados a:
 
 ## Prompts
 
-_Nenhum prompt cadastrado ainda._
+- [triar-pods-kubernetes](./triar-pods-kubernetes/) — Analisa um snapshot de cluster Kubernetes (pods, eventos, logs) e entrega diagnóstico priorizado com ações para SRE de plantão.
