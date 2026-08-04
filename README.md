@@ -33,6 +33,7 @@ Pipelines de CI/CD, containers, orquestração, infraestrutura como código, obs
 - [investigar-causa-raiz-elasticsearch](./devops/investigar-causa-raiz-elasticsearch/) — Conduz uma RCA passo a passo (CoT) sobre degradação de latência de busca em um cluster Elasticsearch, cruzando config, métricas e logs para apontar causa-raiz, sintomas e ações.
 - [decidir-estrategia-backpressure-relay](./devops/decidir-estrategia-backpressure-relay/) — Conduz uma análise Tree-of-Thoughts em seis rodadas para decidir a estratégia de backpressure (throttle, desvio, buffer ou descarte) de um pipeline de ingestão de telemetria, com árvore de opções, matriz de critérios ponderados, teste adversarial e recomendação final acionável.
 - [migrar-pipeline-dados-batch-para-streaming](./devops/migrar-pipeline-dados-batch-para-streaming/) — Cadeia de 11 prompts Least-to-Most (1 de decomposição + 10 de execução, um por etapa) para planejar e executar a migração de um pipeline de dados de processamento em lote para event-driven, do inventário inicial ao cutover incremental e desligamento do batch.
+- [corrigir-networkpolicy-kubernetes](./devops/corrigir-networkpolicy-kubernetes/) — Reescreve um manifesto de NetworkPolicy do Kubernetes vetado por ser permissivo demais, aplicando Chain-of-Verification e Self-Refine em até 3 iterações para chegar a uma versão mínima, auditável e alinhada a um padrão de segurança de referência.
 
 ### [Produtividade](./produtividade/)
 
