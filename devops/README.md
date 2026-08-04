@@ -22,3 +22,4 @@ Entram aqui prompts relacionados a:
 ## Prompts
 
 - [triar-pods-kubernetes](./triar-pods-kubernetes/) — Analisa um snapshot de cluster Kubernetes (pods, eventos, logs) e entrega diagnóstico priorizado com ações para SRE de plantão.
+- [gerar-nota-triagem-incidente](./gerar-nota-triagem-incidente/) — Transforma um alerta de monitoramento em uma nota de triagem de cinco campos (alerta, impacto, hipótese, ação, escalação) para abrir incidentes de plantão.
