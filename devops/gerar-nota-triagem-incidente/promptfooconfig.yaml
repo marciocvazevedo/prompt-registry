@@ -1,0 +1,58 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: openai:gpt-4o-mini
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 4096
+      temperature: 0.0
+defaultTest:
+  assert:
+    # --- 1. os cinco rótulos ---
+    - type: contains
+      value: "ALERTA:"
+    - type: contains
+      value: "IMPACTO:"
+    - type: contains
+      value: "HIPÓTESE INICIAL:"
+    - type: contains
+      value: "AÇÃO IMEDIATA:"
+    - type: contains
+      value: "ESCALAR PARA:"
+
+    # --- 2. handle no campo de escalonamento ---
+    # sem flag /s: o "." não atravessa \n, então o handle
+    # obrigatoriamente está na MESMA linha do rótulo.
+    - type: regex
+      value: 'ESCALAR PARA:.*@\w+'
+
+    # --- 3. concisão: no máximo 8 linhas ---
+    - type: javascript
+      value: |
+        const linhas = output.trim().split(/\r?\n/).filter(l => l.trim() !== '');
+        return linhas.length <= 8
+          ? { pass: true,  score: 1, reason: `OK: ${linhas.length} linha(s).` }
+          : { pass: false, score: 0, reason: `Nota com ${linhas.length} linhas (máx. 8).` };
+
+    # --- guarda de texto puro (RESULT: sem markdown, sem blocos de código) ---
+    - type: not-contains
+      value: "```"
+
+    - type: latency
+      threshold: 8000
+    - type: cost
+      threshold: 0.01
+tests:
+  - vars:
+      MENSAGEM_DE_ALERTA: > 
+        2026-05-12 14:02:09 UTC [Sentinel] autoscaler hit max replicas (60/60) on sentinel-api,
+        queue depth on Relay growing 2k/min, CPU avg 88%, tenant stark-industries
+        sending 4x baseline volume after onboarding new region
+  - vars:
+      MENSAGEM_DE_ALERTA: > 
+        2026-05-13 03:11:00 UTC [Relay] ingest reject rate 6% for 8min, tenant wakanda-systems,
+        buffer saturated after deploy 02:55
+  - vars:
+      MENSAGEM_DE_ALERTA: > 
+        2026-05-13 11:40:22 UTC [Forge] consumer lag 9min and climbing, batch forge-batch-ingest delayed
+        after previous job failure, downstream Sentinel starting to lag

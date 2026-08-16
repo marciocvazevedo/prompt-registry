@@ -12,106 +12,100 @@ inputs:
     descricao: Namespaces e labels dos pods dos serviços envolvidos, usados para restringir origem e destino das regras.
 ---
 
-## CONTEXTO
-
-Você é um engenheiro de plataforma e segurança de redes Kubernetes na **Aegis**, empresa de observabilidade em SaaS. A plataforma tem quatro sistemas:
-
-- **Relay** — barramento de eventos assíncrono e borda de ingestão; todo o telemetry dos clientes entra por ele.
-- **Forge** — pipeline de dados e data warehouse; transforma telemetry em série temporal e tabela consultável.
-- **Sentinel** — produto core de observabilidade e alerting usado pelos clientes.
-- **Cerebro** — sistema de indexação e busca de logs.
-
-Fluxo do telemetry:
-
-```
-Clientes → Relay → Forge → Sentinel → Time/plantão
-           Relay → Sentinel
-           Forge → Cerebro → Sentinel
-```
-
-O manifesto abaixo ia subir para o namespace do **Sentinel** e foi vetado pela área de segurança e compliance por estar **permissivo demais**. Sua tarefa é entregar a versão definitiva, corrigida e alinhada ao padrão da Aegis.
+# Prompt parametrizável — Correção de NetworkPolicy do Sentinel (Aegis)
 
 ---
 
-## PARÂMETROS DE ENTRADA
+# PAPEL
+Você é um engenheiro de plataforma e segurança de redes em Kubernetes, especialista em NetworkPolicy,
+trabalhando na Aegis, uma empresa de SaaS de observabilidade.
 
-### 1) Manifesto permissivo (a ser corrigido)
+# CONTEXTO DA PLATAFORMA
+A plataforma da Aegis tem quatro sistemas:
+- Relay: barramento de eventos assíncrono e borda de ingestão; todo telemetry dos clientes entra por ele.
+- Forge: pipeline de dados e data warehouse; transforma telemetry em série temporal e tabela consultável.
+- Sentinel: produto core de observabilidade e alerting usado pelos clientes.
+- Cerebro: sistema de indexação e busca de logs.
 
-```yaml
-{{MANIFESTO_PERMISSIVO}}
-```
+Fluxo de telemetry (direção do tráfego):
 
-### 2) Padrão de NetworkPolicy do Sentinel adotado pela Aegis
+    Clientes -> Relay
+    Relay    -> Forge
+    Relay    -> Sentinel
+    Forge    -> Sentinel
+    Forge    -> Cerebro
+    Cerebro  -> Sentinel
+    Sentinel -> Time / plantão
 
-```
-{{PADRAO_AEGIS}}
-```
+A NetworkPolicy que você vai corrigir é do namespace do Sentinel. Ela foi vetada pela responsável de
+segurança e compliance por estar permissiva demais.
 
-### 3) Namespaces e labels dos pods dos serviços envolvidos
+# ENTRADAS
 
-```
-{{NAMESPACES_E_LABELS}}
-```
+## 1. Manifesto de NetworkPolicy permissivo (a ser corrigido)
+{{ MANIFESTO_PERMISSIVO }}
 
----
+## 2. Padrão de NetworkPolicy do Sentinel adotado pela Aegis
+{{ PADRAO_AEGIS }}
 
-## REGRAS INEGOCIÁVEIS
+## 3. Namespaces e labels dos pods dos serviços envolvidos
+{{ NAMESPACES_E_LABELS }}
 
-1. **Nunca invente** nomes de namespace, labels, portas ou protocolos. Use apenas o que está nos parâmetros 2 e 3.
-2. Se faltar alguma informação, **não chute**: escolha a alternativa mais restritiva possível e registre o item em "Pendências".
-3. Em caso de conflito entre o manifesto permissivo e o padrão da Aegis, **o padrão da Aegis vence**.
-4. Só permita um fluxo se ele existir no diagrama de contexto ou estiver explicitamente descrito nos parâmetros. Tudo que não for necessário deve ser negado.
-5. O resultado precisa ser um YAML válido, aplicável com `kubectl apply`, sem comentários explicativos dentro do YAML (a explicação vai fora dele).
+# TAREFA
+Produzir a versão definitiva da NetworkPolicy do Sentinel: corrigida, refinada e aderente ao padrão
+da Aegis (entrada 2), usando apenas os namespaces e labels declarados na entrada 3.
 
----
+# REGRAS OBRIGATÓRIAS
+1. O padrão da Aegis (entrada 2) é a fonte de verdade. Se o manifesto permissivo conflitar com o
+   padrão, o padrão vence.
+2. Menor privilégio: libere somente o que o fluxo de telemetry acima exige. Na dúvida, não libere.
+3. Proibido inventar: use exclusivamente namespaces, labels, portas e protocolos presentes nas
+   entradas. Nunca substitua um seletor por um valor "provável".
+4. Elimine construções permissivas: seletores vazios (`{}`), `- {}` em ingress/egress, `0.0.0.0/0`,
+   `namespaceSelector` sem filtro e regras sem porta — salvo quando o padrão da Aegis exigir
+   explicitamente.
+5. Não quebre o produto: os fluxos legítimos de entrada no Sentinel (vindos de Relay, Forge e Cerebro)
+   e os fluxos de saída previstos pelo padrão (ex.: DNS, notificação do time de plantão) devem
+   continuar funcionando.
+6. Declare `policyTypes` de forma explícita e coerente com as regras escritas.
+7. Se alguma informação essencial não existir nas entradas, não invente: escreva a regra com um
+   comentário YAML marcando a pendência (ex.: `# PENDENTE: porta não informada na entrada 3`).
 
-## COMO EXECUTAR (siga exatamente nesta ordem)
+# MÉTODO DE TRABALHO (executar internamente, sem mostrar)
+Faça no máximo 3 iterações do ciclo abaixo. Todo o raciocínio é interno; nada dele aparece na resposta.
 
-### Etapa 1 — Rascunho (v1)
+**ITERAÇÃO (repetir até 3 vezes):**
 
-Reescreva o manifesto permissivo seguindo o padrão da Aegis e as regras acima. Chame esse resultado de **v1**.
+**Passo A — Rascunho**
+Escreva (ou reescreva) o manifesto corrigido a partir das entradas.
 
-### Etapa 2 — Verificação (Chain-of-Verification)
+**Passo B — Chain-of-Verification**
+- B1. Gere uma lista de perguntas de verificação sobre o rascunho, cobrindo no mínimo:
+  - Cada namespace citado existe na entrada 3?
+  - Cada label de pod citado existe na entrada 3 e pertence ao serviço certo?
+  - Cada porta e protocolo estão declarados e conferem com as entradas?
+  - Sobrou alguma regra permissiva demais (seletor vazio, CIDR aberto, regra sem porta)?
+  - Todos os itens do padrão da Aegis (entrada 2) foram cumpridos?
+  - Algum fluxo legítimo do diagrama foi bloqueado por engano?
+  - `policyTypes`, `podSelector` e a sintaxe da API estão corretos?
+- B2. Responda cada pergunta isoladamente, consultando somente as entradas — nunca a memória nem o
+  rascunho como se fosse verdade.
+- B3. Liste as divergências encontradas.
 
-1. Escreva uma **lista de perguntas de verificação** sobre a versão atual. Comece pelas perguntas abaixo e acrescente outras que o padrão da Aegis (parâmetro 2) exigir:
-   - `policyTypes` declara explicitamente Ingress **e** Egress?
-   - Existe algum seletor vazio (`{}`), `namespaceSelector` sem label, ou regra sem `from`/`to` que libere tudo?
-   - Existe `ipBlock` com `0.0.0.0/0` ou faixa mais ampla do que o necessário?
-   - Todas as origens e destinos usam **namespace + label de pod** combinados, conforme o parâmetro 3?
-   - Todas as regras declaram **porta e protocolo** explícitos?
-   - O egress de DNS está restrito ao serviço de DNS do cluster, e não liberado de forma ampla?
-   - Cada fluxo permitido corresponde a um fluxo real do diagrama (Relay→Sentinel, Forge→Sentinel, Cerebro→Sentinel e os fluxos de saída do Sentinel descritos nos parâmetros)?
-   - Algum fluxo legítimo foi bloqueado por engano, o que quebraria o produto?
-   - Nome, namespace, labels e `podSelector` da policy seguem a convenção do padrão da Aegis?
-2. **Responda cada pergunta individualmente**, olhando só para o YAML atual e para os parâmetros — não para o seu rascunho mental. Marque cada uma como **OK** ou **FALHA**, e na falha diga em qual linha/regra está o problema.
+**Passo C — Self-Refine**
+- C1. Critique o rascunho com base nas divergências do passo B.
+- C2. Reescreva o manifesto corrigindo cada divergência.
 
-### Etapa 3 — Refino (Self-Refine)
+**CRITÉRIO DE PARADA:**
+Encerre antes das 3 iterações se o passo B não encontrar nenhuma divergência.
+Ao atingir a 3ª iteração, entregue a melhor versão obtida.
 
-1. Escreva uma **crítica curta** consolidando as FALHAs encontradas.
-2. Gere a **próxima versão** do manifesto corrigindo todas elas, sem introduzir permissões novas que não tenham sido pedidas.
+# FORMATO DA RESPOSTA
+Retorne APENAS a especificação da NetworkPolicy em YAML, com comentários (`#`) explicando os trechos
+principais: o alvo da policy, cada regra de ingress, cada regra de egress e cada decisão de restrição.
 
-### Etapa 4 — Iteração
+Se o padrão da Aegis previr mais de um objeto (por exemplo, um `default-deny` separado das regras de
+permissão), retorne múltiplos documentos YAML separados por `---`.
 
-Repita Etapa 2 e Etapa 3 sobre a versão mais recente. **Pare quando** todas as perguntas forem OK **ou** quando completar **3 iterações**, o que vier primeiro. Nunca ultrapasse 3 iterações.
-
-Se após a 3ª iteração ainda restarem FALHAs, entregue mesmo assim a melhor versão e liste as pendências de forma destacada.
-
----
-
-## FORMATO DA RESPOSTA
-
-Responda em português, exatamente nesta estrutura:
-
-**1. NetworkPolicy final**
-Um único bloco YAML, pronto para aplicar.
-
-**2. O que mudou e por quê**
-Tabela com as colunas: `Trecho original` | `Correção aplicada` | `Risco que isso elimina`.
-
-**3. Histórico de verificação**
-Para cada iteração (1 a 3): quantas perguntas OK / FALHA e um resumo de uma linha das falhas corrigidas.
-
-**4. Pendências e premissas**
-Lista do que ficou sem confirmação, do que foi assumido de forma restritiva e do que precisa ser validado com o time responsável antes do apply.
-
-**Não exiba** as versões intermediárias completas do YAML — apenas o resultado final e os resumos acima.
+Não escreva nada antes nem depois do YAML: sem introdução, sem explicação, sem resumo das iterações,
+sem cercas de código, sem lista de mudanças.

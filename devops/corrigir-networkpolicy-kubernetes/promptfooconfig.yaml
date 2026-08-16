@@ -1,0 +1,96 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: openai:gpt-4o-mini
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 4096
+      temperature: 0.0
+tests:
+  - vars:
+      MANIFESTO_PERMISSIVO: | 
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: sentinel-allow
+          namespace: sentinel-prod
+        spec:
+          podSelector: {}          # aplica a todos os pods do namespace
+          policyTypes:
+            - Ingress
+            - Egress
+          ingress:
+            - {}                   # libera QUALQUER origem
+          egress:
+            - {}                   # libera QUALQUER destino
+      PADRAO_AEGIS: | 
+        NetworkPolicy para o namespace "sentinel-prod":
+        - pods do Sentinel só aceitam tráfego de entrada do Relay (consumo de eventos) e do gateway de API da plataforma
+        - pods do Sentinel só fazem saída para: Forge (warehouse, porta 5432), Cerebro (busca, porta 9200) e DNS interno
+        - nada de "allow all" em ingress ou egress
+        - política default-deny explícita no namespace
+        - toda regra precisa de comentário dizendo qual fluxo legítimo ela libera
+      NAMESPACES_E_LABELS: | 
+        Sentinel     → namespace sentinel-prod, pods com label app=sentinel
+        Relay        → namespace relay-prod,    pods com label app=relay
+        API gateway  → namespace edge,          pods com label app=api-gateway
+        Forge        → namespace forge-prod,    pods com label app=forge,   porta 5432 (Postgres do warehouse)
+        Cerebro      → namespace cerebro-prod,  pods com label app=cerebro, porta 9200 (Elasticsearch)
+        DNS interno  → namespace kube-system,   pods com label k8s-app=kube-dns, porta 53
+    assert:
+      # ---------------------------------------------------------------------
+      # 1) A saída é YAML válido (um ou mais documentos)
+      # ---------------------------------------------------------------------
+      - type: javascript
+        value: file://asserts/valid-yaml.cjs 
+
+      # ---------------------------------------------------------------------
+      # 2) A saída possui kind: NetworkPolicy
+      # ---------------------------------------------------------------------
+      - type: contains
+        value: "kind: NetworkPolicy"
+
+      # ---------------------------------------------------------------------
+      # 3) policyTypes contendo Ingress e Egress (nessa ordem, em algum ponto
+      #    após a chave policyTypes)
+      # ---------------------------------------------------------------------
+      - type: regex
+        value: "policyTypes:[\\s\\S]*?-\\s*Ingress[\\s\\S]*?-\\s*Egress"
+
+      # ---------------------------------------------------------------------
+      # 4) Não há regra allow-all (a saída não contém "- {}")
+      # ---------------------------------------------------------------------
+      - type: not-contains
+        value: "- {}"
+
+      # ---------------------------------------------------------------------
+      # 5) O egress libera Forge (porta 5432): exige "app: forge" seguido,
+      #    a uma distância razoável, de "5432"
+      # ---------------------------------------------------------------------
+      - type: regex
+        value: "app:\\s*forge[\\s\\S]{0,300}?5432"
+
+      # ---------------------------------------------------------------------
+      # 6) O egress libera Cerebro (porta 9200): exige "app: cerebro" seguido,
+      #    a uma distância razoável, de "9200"
+      # ---------------------------------------------------------------------
+      - type: regex
+        value: "app:\\s*cerebro[\\s\\S]{0,300}?9200"
+
+      # ---------------------------------------------------------------------
+      # 7) O ingress libera o Relay (app: relay)
+      # ---------------------------------------------------------------------
+      - type: contains
+        value: "app: relay"
+
+      # ---------------------------------------------------------------------
+      # 8) Toda regra de ingress/egress tem comentário explicativo, em qualquer
+      #    posição sintaticamente válida (acima, inline ou dentro do bloco)
+      # ---------------------------------------------------------------------
+      - type: javascript
+        value: file://asserts/regra8-comentarios.cjs
+
+      - type: latency
+        threshold: 7000
+      - type: cost
+        threshold: 0.01
