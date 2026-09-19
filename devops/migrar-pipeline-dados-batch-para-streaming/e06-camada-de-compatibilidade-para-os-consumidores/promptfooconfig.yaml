@@ -1,0 +1,3832 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 40000
+      stream: true
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://../rubric/judge-forge-streaming.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a etapa de camada de compatibilidade para os consumidores da cadeia Least-to-Most de migração do Forge (batch -> event-driven)
+        conforme a rubrica C1-C4, o gabarito e a regra de decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      SISTEMA: Forge
+      FONTE_EVENTOS: Relay
+      DW: data warehouse do Forge
+      CONSUMIDORES: Sentinel (tabelas agregadas), Cerebro (índice de eventos transformados), relatórios de billing da Pepper (execução de madrugada)
+      JANELA_ATUAL: 60 min
+      DURACAO_JOB: ~40 min
+      N_ETAPAS: 14
+      ENGINE: Spark
+      PARTICIONAMENTO: por hora
+      LATENCIA_ALVO: 2 min (p95, do evento no Relay até consultável no DW)
+      TAMANHO_MICRO_LOTE: 30 s
+      AMBIENTE: staging → produção
+      JANELA_DUAL_RUN: 14 dias
+      FATIA_CUTOVER: por tenant, começando pelos 5 menores
+      TOLERANCIA_DIVERGENCIA: 0,1% das linhas por hora
+      FORMATO_SAIDA: Markdown com passos numerados
+      etapa_numero: 6
+      etapa_nome: Camada de compatibilidade para os consumidores
+      INSUMO_ETAPA_2: |
+        # Etapa 2 de 10: Metas, SLOs e Critérios de Equivalência — Procedimento Técnico
+
+        ---
+
+        ## 0. Pré-requisitos
+
+        - [ ] Acesso de leitura ao repositório de SLAs e políticas da Aegis (ex: `aegis/docs/slas/`, Confluence, etc.)
+        - [ ] Acesso ao código-fonte de Sentinel, Cerebro e Pepper para entender semântica de leitura esperada
+        - [ ] Acesso a logs de queries e erros dos consumidores (últimos 30 dias)
+        - [ ] Contato técnico confirmado em cada time consumidor (Sentinel, Cerebro, Pepper) para validar SLAs herdados
+        - [ ] Acesso ao repositório de configuração do Forge para documentar SLOs propostos
+        - [ ] Ferramentas: editor de texto, SQL client, `git`, planilha colaborativa (para alinhamento com stakeholders)
+        - [ ] Resultado da Etapa 1 disponível: baseline de latência, volume, taxa de falha, consumidores mapeados
+        - [ ] Permissão para criar documentos de design (ADR — Architecture Decision Record) no repositório
+
+        ---
+
+        ## 1. Defina SLOs do novo Forge (frescor, completude, disponibilidade, recuperação)
+
+        **Ação:** Formalize os objetivos de nível de serviço para o Forge em streaming, baseado no objetivo de 2 min (p95) e nas necessidades dos consumidores.
+
+        **Onde:** Arquivo `forge/docs/slos.md` (novo ou atualizado) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 1.1 Frescor (Freshness)
+
+        **Definição:** Tempo máximo entre a chegada de um evento no Relay e sua disponibilidade para consulta no DW.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Frescor (Freshness)
+
+        ## Definição
+        Tempo decorrido desde a chegada de um evento no Relay até estar consultável 
+        (SELECT retorna resultado) em uma tabela do DW.
+
+        ## Métrica
+        - **Nome:** `forge_event_latency_p95_seconds`
+        - **Fórmula:** P95 de (timestamp_consultado_no_dw - timestamp_chegada_no_relay)
+        - **Granularidade:** Por tenant, por hora
+        - **Coleta:** Instrumentação no Relay (timestamp de entrada) e no Forge (timestamp de escrita no DW)
+
+        ## SLO
+        | Percentil | Latência alvo | Justificativa |
+        |-----------|---------------|---------------|
+        | p50       | 30 s          | Mediana: processamento rápido para dashboards |
+        | p95       | 120 s (2 min) | Alvo do projeto; suficiente para alertas em tempo real |
+        | p99       | 300 s (5 min) | Cauda: permite processamento de picos sem violar p95 |
+
+        ## Baseline (Etapa 1)
+        - p50: ~60 min (batch)
+        - p95: ~105 min (batch)
+        - p99: ~120 min (batch)
+
+        ## Melhoria esperada
+        - p95: 105 min → 2 min (52× mais rápido)
+        - Impacto: Sentinel pode atualizar dashboards a cada 30 s em vez de 60 min
+        ```
+
+        **Verificação:** Arquivo criado com SLO de frescor documentado; p95 = 120 s confirmado.
+
+        ---
+
+        ### 1.2 Completude (Completeness)
+
+        **Definição:** Percentual de eventos que chegam no Relay e são processados até o DW sem perda.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Completude (Completeness)
+
+        ## Definição
+        Percentual de eventos que chegam no Relay e aparecem no DW dentro do SLO de frescor.
+
+        ## Métrica
+        - **Nome:** `forge_completeness_percent`
+        - **Fórmula:** (eventos_no_dw / eventos_no_relay) * 100
+        - **Granularidade:** Por tenant, por hora
+        - **Coleta:** 
+          - Relay: contar mensagens consumidas (offset)
+          - DW: contar linhas inseridas (com deduplicação por event_id)
+
+        ## SLO
+        | Métrica | Alvo | Justificativa |
+        |---------|------|---------------|
+        | Completude geral | ≥ 99.9% | Perda < 0.1% é aceitável para observabilidade |
+        | Completude por tenant | ≥ 99.5% | Tenants pequenos podem ter variação maior |
+        | Completude por hora | ≥ 99.0% | Horas de pico podem ter reprocessamento |
+
+        ## Baseline (Etapa 1)
+        - Completude geral: ~99.5% (falhas causam perda de 1 lote = ~0.5%)
+        - Causa de perda: falhas de job, timeouts, deadlocks
+
+        ## Melhoria esperada
+        - Streaming com idempotência: ≥ 99.9% (reprocessamento automático sem perda)
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de completude; alvo ≥ 99.9% documentado.
+
+        ---
+
+        ### 1.3 Disponibilidade (Availability)
+
+        **Definição:** Percentual de tempo em que o Forge está processando eventos e os consumidores podem consultar dados atualizados.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Disponibilidade (Availability)
+
+        ## Definição
+        Percentual de tempo em que:
+        1. O Forge está consumindo eventos do Relay sem interrupção
+        2. O DW está aceitando escritas
+        3. Os consumidores podem executar queries sem erro
+
+        ## Métrica
+        - **Nome:** `forge_availability_percent`
+        - **Fórmula:** (tempo_sem_erro / tempo_total) * 100
+        - **Granularidade:** Por hora
+        - **Coleta:** Heartbeat do job de streaming; status de queries no DW
+
+        ## SLO
+        | Métrica | Alvo | Justificativa |
+        |---------|------|---------------|
+        | Disponibilidade geral | ≥ 99.5% | ~3.6 horas de downtime/mês aceitável |
+        | Disponibilidade de Relay | ≥ 99.9% | Relay é crítico; gerenciado por time separado |
+        | Disponibilidade de DW | ≥ 99.9% | DW é crítico; gerenciado por time separado |
+        | Disponibilidade do Forge | ≥ 99.0% | Forge pode falhar; recuperação automática esperada |
+
+        ## Baseline (Etapa 1)
+        - Disponibilidade: ~99.0% (taxa de falha ~1%, MTBF ~1440 min)
+        - Causa de indisponibilidade: falhas de job, OOM, timeouts
+
+        ## Melhoria esperada
+        - Streaming com auto-recovery: ≥ 99.5% (recuperação em < 5 min)
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de disponibilidade; alvo ≥ 99.5% documentado.
+
+        ---
+
+        ### 1.4 Tempo de Recuperação (Recovery Time Objective — RTO)
+
+        **Definição:** Tempo máximo para o Forge recuperar-se de uma falha e voltar a processar eventos.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Tempo de Recuperação (RTO — Recovery Time Objective)
+
+        ## Definição
+        Tempo decorrido desde a detecção de uma falha até o Forge voltar a processar 
+        eventos e reduzir o lag (atraso) para < 1 min.
+
+        ## Métrica
+        - **Nome:** `forge_recovery_time_seconds`
+        - **Fórmula:** timestamp_lag_reduzido - timestamp_falha_detectada
+        - **Granularidade:** Por incidente
+        - **Coleta:** Logs de job; métrica de lag do consumer group
+
+        ## SLO
+        | Cenário | RTO alvo | Justificativa |
+        |---------|----------|---------------|
+        | Falha de task (1 de N) | 30 s | Auto-restart rápido |
+        | Falha de job (todos os tasks) | 5 min | Redeploy + rebalance |
+        | Falha de DW (indisponibilidade) | 15 min | Fora do escopo do Forge; SLA do DW |
+        | Falha de Relay (indisponibilidade) | 15 min | Fora do escopo do Forge; SLA do Relay |
+
+        ## Baseline (Etapa 1)
+        - RTO atual: ~60 min (próximo lote batch)
+        - Causa: job falha, aguarda próximo agendamento
+
+        ## Melhoria esperada
+        - RTO: 60 min → 5 min (12× mais rápido)
+        - Impacto: Sentinel não fica sem dados por > 5 min
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de RTO; alvo ≤ 5 min documentado.
+
+        ---
+
+        ### 1.5 Objetivo de Ponto de Recuperação (RPO — Recovery Point Objective)
+
+        **Definição:** Quantidade máxima de dados que podem ser perdidos em caso de falha.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Objetivo de Ponto de Recuperação (RPO — Recovery Point Objective)
+
+        ## Definição
+        Quantidade máxima de eventos que podem ser perdidos entre a última escrita 
+        bem-sucedida no DW e uma falha.
+
+        ## Métrica
+        - **Nome:** `forge_data_loss_events`
+        - **Fórmula:** eventos_no_buffer_nao_confirmados
+        - **Granularidade:** Por falha
+        - **Coleta:** Offset do consumer group; checkpoint do Forge
+
+        ## SLO
+        | Cenário | RPO alvo | Justificativa |
+        |---------|----------|---------------|
+        | Falha de task | 0 eventos | Streaming com checkpoint; sem perda |
+        | Falha de job | ≤ 30 s de eventos | Buffer em memória; reprocessamento automático |
+        | Falha de Relay | Fora do escopo | Relay gerencia sua própria retenção |
+
+        ## Baseline (Etapa 1)
+        - RPO atual: ~60 min de eventos (1 lote inteiro perdido se falha antes de escrita)
+        - Causa: batch sem checkpoint intermediário
+
+        ## Melhoria esperada
+        - RPO: 60 min → 0 eventos (streaming com checkpoint)
+        - Impacto: Nenhuma perda de dados; reprocessamento automático
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de RPO; alvo = 0 eventos documentado.
+
+        ---
+
+        ### 1.6 Consolidação de SLOs
+
+        **Ação:** Crie tabela consolidada de SLOs.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Tabela Consolidada de SLOs do Forge (Streaming)
+
+        | Dimensão | Métrica | Alvo | Baseline | Melhoria |
+        |----------|---------|------|----------|----------|
+        | **Frescor** | p50 latência | 30 s | 60 min | 120× |
+        | | p95 latência | 120 s | 105 min | 52× |
+        | | p99 latência | 300 s | 120 min | 24× |
+        | **Completude** | Completude geral | ≥ 99.9% | ~99.5% | +0.4% |
+        | | Completude por tenant | ≥ 99.5% | ~99.0% | +0.5% |
+        | **Disponibilidade** | Disponibilidade geral | ≥ 99.5% | ~99.0% | +0.5% |
+        | | Disponibilidade Forge | ≥ 99.0% | ~99.0% | — |
+        | **Recuperação** | RTO (falha de task) | 30 s | 60 min | 120× |
+        | | RTO (falha de job) | 5 min | 60 min | 12× |
+        | | RPO | 0 eventos | 60 min | ∞ |
+
+        ## Notas
+        - Frescor é a métrica mais crítica; impacta Sentinel (dashboards) e Cerebro (indexação).
+        - Completude é crítica para Pepper (billing); perda de dados = perda de receita.
+        - Disponibilidade é crítica para todos os consumidores; downtime = impacto em cascata.
+        - RTO é crítico para SLA de Sentinel; > 5 min viola SLA de latência.
+        ```
+
+        **Verificação:** Tabela consolidada criada; todos os SLOs documentados com alvo, baseline e melhoria esperada.
+
+        ---
+
+        ## 2. Defina semântica de entrega alvo e implicações por consumidor
+
+        **Ação:** Formalize a semântica de entrega (at-least-once, exactly-once, etc.) e mapeie implicações para cada consumidor.
+
+        **Onde:** Arquivo `forge/docs/delivery-semantics.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 2.1 Escolha da semântica de entrega
+
+        **Ação:** Analise trade-offs entre semânticas e escolha a mais apropriada.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Semântica de Entrega do Forge (Streaming)
+
+        ## Opções e Trade-offs
+
+        ### 1. At-Most-Once (AMO)
+        - **Definição:** Cada evento é processado 0 ou 1 vez.
+        - **Implementação:** Sem checkpoint; sem retry.
+        - **Vantagens:** Latência mínima; simplicidade.
+        - **Desvantagens:** Perda de dados em falhas; viola SLO de completude (99.9%).
+        - **Adequado para:** Métricas aproximadas (ex: amostragem).
+        - **Decisão:** ❌ REJEITADO — Completude é crítica para billing (Pepper).
+
+        ### 2. At-Least-Once (ALO)
+        - **Definição:** Cada evento é processado ≥ 1 vez.
+        - **Implementação:** Checkpoint + retry; sem deduplicação.
+        - **Vantagens:** Sem perda de dados; latência baixa; simples.
+        - **Desvantagens:** Duplicatas possíveis; requer idempotência no consumidor.
+        - **Adequado para:** Agregações (SUM, COUNT com deduplicação).
+        - **Decisão:** ✅ ACEITO — Semântica padrão com idempotência.
+
+        ### 3. Exactly-Once (EXO)
+        - **Definição:** Cada evento é processado exatamente 1 vez.
+        - **Implementação:** Checkpoint + transação atômica (Forge + DW).
+        - **Vantagens:** Sem duplicatas; sem perda.
+        - **Desvantagens:** Latência maior; complexidade (2-phase commit); custo.
+        - **Adequado para:** Billing, contabilidade.
+        - **Decisão:** ⚠️ CONDICIONAL — Usar apenas para tabelas críticas (ex: `forge_sla_violations`).
+
+        ## Semântica Escolhida: At-Least-Once com Idempotência
+
+        **Justificativa:**
+        - Completude ≥ 99.9% é alcançável com ALO + retry.
+        - Idempotência é simples: deduplicar por `event_id` no DW.
+        - Latência é baixa: sem overhead de 2-phase commit.
+        - Custo é menor: sem transações distribuídas.
+
+        **Implementação:**
+        1. Forge consome do Relay com checkpoint a cada 30 s.
+        2. Forge processa eventos em blocos de 30 s.
+        3. Forge escreve no DW com `INSERT ... ON CONFLICT DO NOTHING` (ou equivalente).
+        4. Se falha antes de checkpoint, reprocessa bloco (duplicatas possíveis).
+        5. Deduplicação no DW garante idempotência.
+
+        **Garantias:**
+        - ✅ Sem perda de dados (checkpoint + retry).
+        - ✅ Sem duplicatas visíveis (deduplicação no DW).
+        - ✅ Latência baixa (sem 2-phase commit).
+        - ✅ Custo baixo (sem transações distribuídas).
+        ```
+
+        **Verificação:** Arquivo criado com semântica ALO + idempotência escolhida e justificada.
+
+        ---
+
+        ### 2.2 Implicações por consumidor
+
+        **Ação:** Mapeie como cada consumidor deve lidar com a semântica ALO.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Implicações da Semântica At-Least-Once por Consumidor
+
+        ## 1. Sentinel (Dashboards e Alertas)
+
+        ### Expectativa atual (Batch)
+        - Dados chegam a cada 60 min.
+        - Sem duplicatas (batch é idempotente por natureza).
+        - Sem perda (falha = pula 1 lote, próximo lote processa o dobro).
+
+        ### Expectativa nova (Streaming ALO)
+        - Dados chegam a cada 30 s.
+        - Possíveis duplicatas em caso de reprocessamento (ex: 2 eventos com mesmo event_id).
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Sentinel
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Latência** | ↓ 52× (105 min → 2 min) | Atualizar SLA de dashboard de 5 min para 2 min |
+        | **Duplicatas** | Possíveis em reprocessamento | Queries devem usar `DISTINCT` ou `GROUP BY` com `MAX(timestamp)` |
+        | **Agregações** | SUM, COUNT podem ter +1 em reprocessamento | Usar `SUM(DISTINCT event_id)` ou deduplicar antes de agregar |
+        | **Alertas** | Podem disparar 2× se evento reprocessado | Adicionar deduplicação por `event_id` + `timestamp` em alertas |
+
+        ### Validação necessária
+        - [ ] Sentinel consegue lidar com duplicatas em queries?
+        - [ ] Alertas disparam corretamente com duplicatas?
+        - [ ] Dashboard atualiza a cada 30 s sem overhead?
+
+        ### Exemplo de query compatível
+        ```sql
+        -- ❌ ANTES (batch, sem duplicatas)
+        SELECT
+          tenant_id,
+          SUM(error_count) AS total_errors,
+          SUM(error_count) / SUM(request_count) AS error_rate
+        FROM forge_events_by_service
+        WHERE hour = DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+        GROUP BY tenant_id;
+
+        -- ✅ DEPOIS (streaming, com deduplicação)
+        SELECT
+          tenant_id,
+          SUM(error_count) AS total_errors,
+          SUM(error_count) / SUM(request_count) AS error_rate
+        FROM (
+          SELECT DISTINCT ON (event_id)
+            tenant_id,
+            error_count,
+            request_count,
+            timestamp
+          FROM forge_events_by_service
+          WHERE hour = DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+          ORDER BY event_id, timestamp DESC
+        ) dedup
+        GROUP BY tenant_id;
+        ```
+
+        ---
+
+        ## 2. Cerebro (Indexação de Logs)
+
+        ### Expectativa atual (Batch)
+        - Índice atualizado a cada 60 min.
+        - Sem duplicatas (batch é idempotente).
+        - Sem perda (falha = pula 1 lote).
+
+        ### Expectativa nova (Streaming ALO)
+        - Índice atualizado a cada 30 s.
+        - Possíveis duplicatas em caso de reprocessamento.
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Cerebro
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Latência** | ↓ 52× (105 min → 2 min) | Índice fica mais fresco; queries retornam dados mais recentes |
+        | **Duplicatas** | Possíveis em reprocessamento | Indexador deve deduplicar por `event_id` antes de indexar |
+        | **Tamanho do índice** | Pode crescer 2× se duplicatas não forem removidas | Implementar deduplicação no indexador |
+        | **Queries** | Podem retornar duplicatas se não deduplicadas | Queries devem usar `DISTINCT` ou filtro por `timestamp DESC` |
+
+        ### Validação necessária
+        - [ ] Cerebro consegue ingerir dados a cada 30 s?
+        - [ ] Deduplicação funciona corretamente?
+        - [ ] Tamanho do índice não explode?
+
+        ### Exemplo de ingestão compatível
+        ```python
+        # ❌ ANTES (batch, sem deduplicação)
+        def ingest_batch(events):
+            for event in events:
+                index.add(event)
+
+        # ✅ DEPOIS (streaming, com deduplicação)
+        def ingest_stream(events):
+            seen = set()
+            for event in events:
+                if event['event_id'] not in seen:
+                    index.add(event)
+                    seen.add(event['event_id'])
+        ```
+
+        ---
+
+        ## 3. Pepper (Billing)
+
+        ### Expectativa atual (Batch)
+        - Relatório de billing roda 1× por dia (02:00 UTC).
+        - Dados são finais (batch processou tudo).
+        - Sem duplicatas (batch é idempotente).
+        - Sem perda (falha = pula 1 lote, próximo lote processa o dobro).
+
+        ### Expectativa nova (Streaming ALO)
+        - Relatório de billing roda 1× por dia (02:00 UTC).
+        - Dados podem ter duplicatas até o momento da query.
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Pepper
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Timing** | Relatório roda no mesmo horário (02:00 UTC) | Sem mudança; Pepper não é afetado por latência |
+        | **Duplicatas** | Possíveis até 02:00 UTC | Query de billing deve deduplicar por `event_id` |
+        | **Completude** | Crítica: perda de dados = perda de receita | Validar que completude ≥ 99.9% antes de cada relatório |
+        | **Reconciliação** | Pode ser necessária se duplicatas causarem overcharging | Implementar validação de duplicatas antes de faturar |
+
+        ### Validação necessária
+        - [ ] Query de billing deduplica corretamente?
+        - [ ] Completude é ≥ 99.9% no momento do relatório?
+        - [ ] Reconciliação detecta e corrige duplicatas?
+
+        ### Exemplo de query compatível
+        ```sql
+        -- ❌ ANTES (batch, sem deduplicação)
+        SELECT
+          tenant_id,
+          SUM(request_count) AS total_requests,
+          SUM(request_count) * 0.001 AS billing_amount_usd
+        FROM forge_events_aggregated
+        WHERE DATE(hour) = CURRENT_DATE - INTERVAL '1 day'
+        GROUP BY tenant_id;
+
+        -- ✅ DEPOIS (streaming, com deduplicação)
+        SELECT
+          tenant_id,
+          SUM(request_count) AS total_requests,
+          SUM(request_count) * 0.001 AS billing_amount_usd
+        FROM (
+          SELECT DISTINCT ON (event_id)
+            tenant_id,
+            request_count,
+            timestamp
+          FROM forge_events_aggregated
+          WHERE DATE(hour) = CURRENT_DATE - INTERVAL '1 day'
+          ORDER BY event_id, timestamp DESC
+        ) dedup
+        GROUP BY tenant_id;
+        ```
+
+        ---
+
+        ## Resumo de Implicações
+
+        | Consumidor | Semântica | Ação necessária | Risco | Mitigação |
+        |-----------|-----------|-----------------|-------|-----------|
+        | **Sentinel** | ALO | Deduplicar em queries; atualizar SLA | Duplicatas em alertas | Testar com reprocessamento |
+        | **Cerebro** | ALO | Deduplicar no indexador | Índice cresce 2× | Monitorar tamanho do índice |
+        | **Pepper** | ALO | Deduplicar em query de billing | Overcharging | Validar completude antes de faturar |
+
+        ```
+
+        **Verificação:** Arquivo criado com implicações por consumidor documentadas; ações necessárias listadas.
+
+        ---
+
+        ## 3. Defina critérios de equivalência: "streaming ≡ batch"
+
+        **Ação:** Formalize como validar que o Forge em streaming produz os mesmos resultados que o batch.
+
+        **Onde:** Arquivo `forge/docs/equivalence-criteria.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 3.1 Definição de equivalência
+
+        **Ação:** Defina o que significa "streaming é equivalente ao batch".
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Critérios de Equivalência: Streaming ≡ Batch
+
+        ## Definição
+        Streaming é equivalente ao batch se, para um período de tempo T:
+        1. Ambos processam o mesmo conjunto de eventos (completude).
+        2. Ambos produzem o mesmo resultado final (corretude).
+        3. Ambos produzem resultados no mesmo formato (schema).
+
+        ## Período de validação
+        - **Janela:** Últimas 24 horas (1 dia completo).
+        - **Granularidade:** Por hora (24 períodos de 1 hora).
+        - **Frequência:** Diária (após cada execução do batch).
+
+        ## Métricas de equivalência
+
+        ### 1. Completude (Row Count)
+        **Métrica:** Número de linhas em cada tabela.
+
+        **Fórmula:**
+        ```
+        completude = (linhas_streaming / linhas_batch) * 100
+        ```
+
+        **Alvo:**
+        - Completude ≥ 99.9% (diferença ≤ 0.1%)
+        - Diferença absoluta ≤ 0.1% das linhas por hora
+
+        **Exemplo:**
+        ```
+        Hora: 2024-01-15 10:00 UTC
+        Tabela: forge_events_aggregated
+        Linhas (batch): 1,000,000
+        Linhas (streaming): 999,900
+        Completude: 99.99% ✅ (diferença = 100 linhas = 0.01%)
+        ```
+
+        ### 2. Corretude (Value Comparison)
+        **Métrica:** Valores de agregações críticas.
+
+        **Fórmula:**
+        ```
+        corretude = (valores_streaming == valores_batch) ? 100% : 0%
+        ```
+
+        **Validação por tabela:**
+
+        #### Tabela: `forge_events_aggregated`
+        ```sql
+        -- Comparar SUM, COUNT, AVG, MIN, MAX por tenant/hora
+        SELECT
+          hour,
+          tenant_id,
+          SUM(request_count) AS sum_requests_batch,
+          COUNT(*) AS count_rows_batch,
+          AVG(error_rate) AS avg_error_rate_batch
+        FROM forge_events_aggregated_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id
+        ORDER BY hour, tenant_id;
+
+        -- Comparar com streaming
+        SELECT
+          hour,
+          tenant_id,
+          SUM(request_count) AS sum_requests_streaming,
+          COUNT(*) AS count_rows_streaming,
+          AVG(error_rate) AS avg_error_rate_streaming
+        FROM forge_events_aggregated_streaming
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id
+        ORDER BY hour, tenant_id;
+
+        -- Diferença
+        SELECT
+          b.hour,
+          b.tenant_id,
+          b.sum_requests_batch,
+          s.sum_requests_streaming,
+          ABS(b.sum_requests_batch - s.sum_requests_streaming) AS diff_sum,
+          CASE
+            WHEN ABS(b.sum_requests_batch - s.sum_requests_streaming) = 0 THEN '✅ OK'
+            ELSE '❌ MISMATCH'
+          END AS status
+        FROM batch_agg b
+        FULL OUTER JOIN streaming_agg s
+          ON b.hour = s.hour AND b.tenant_id = s.tenant_id
+        WHERE b.hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        ORDER BY b.hour, b.tenant_id;
+        ```
+
+        **Alvo:**
+        - Corretude = 100% (sem mismatches)
+        - Diferença absoluta ≤ 0.1% do valor
+
+        #### Tabela: `forge_events_by_service`
+        ```sql
+        -- Comparar error_count, error_rate por tenant/service/hora
+        SELECT
+          hour,
+          tenant_id,
+          service_id,
+          SUM(error_count) AS sum_errors_batch,
+          SUM(request_count) AS sum_requests_batch
+        FROM forge_events_by_service_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id, service_id
+        ORDER BY hour, tenant_id, service_id;
+
+        -- Comparar com streaming (mesmo padrão)
+        -- Validar que error_rate = error_count / request_count
+        ```
+
+        #### Tabela: `forge_sla_violations`
+        ```sql
+        -- Comparar SLA violations por tenant/service/hora
+        SELECT
+          hour,
+          tenant_id,
+          service_id,
+          COUNT(*) AS violations_batch,
+          SUM(CASE WHEN sla_breached THEN 1 ELSE 0 END) AS breached_batch
+        FROM forge_sla_violations_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id, service_id
+        ORDER BY hour, tenant_id, service_id;
+
+        -- Comparar com streaming (mesmo padrão)
+        ```
+
+        ### 3. Schema (Column Comparison)
+        **Métrica:** Estrutura das tabelas (colunas, tipos, ordem).
+
+        **Validação:**
+        ```sql
+        -- Comparar schema de batch vs streaming
+        SELECT
+          column_name,
+          data_type,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'forge_events_aggregated_batch'
+        ORDER BY ordinal_position;
+
+        SELECT
+          column_name,
+          data_type,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'forge_events_aggregated_streaming'
+        ORDER BY ordinal_position;
+
+        -- Diferença
+        SELECT
+          COALESCE(b.column_name, s.column_name) AS column_name,
+          b.data_type AS type_batch,
+          s.data_type AS type_streaming,
+          CASE
+            WHEN b.data_type = s.data_type THEN '✅ OK'
+            ELSE '❌ MISMATCH'
+          END AS status
+        FROM batch_schema b
+        FULL OUTER JOIN streaming_schema s
+          ON b.column_name = s.column_name
+        ORDER BY column_name;
+        ```
+
+        **Alvo:**
+        - Schema = 100% idêntico (mesmas colunas, tipos, ordem)
+
+        ## Resumo de Critérios
+
+        | Critério | Métrica | Alvo | Granularidade | Frequência |
+        |----------|---------|------|---------------|-----------|
+        | **Completude** | Linhas | ≥ 99.9% | Por hora | Diária |
+        | **Corretude** | Valores (SUM, COUNT, AVG) | 100% | Por tenant/hora | Diária |
+        | **Schema** | Colunas e tipos | 100% | Por tabela | Diária |
+        | **Latência** | p95 | ≤ 120 s | Por evento | Contínua |
+        | **Disponibilidade** | Uptime | ≥ 99.5% | Por hora | Contínua |
+
+        ```
+
+        **Verificação:** Arquivo criado com critérios de equivalência documentados; métricas e alvos definidos.
+
+        ---
+
+        ### 3.2 Implementação de validação
+
+        **Ação:** Crie script de validação que compara batch vs streaming.
+
+        **Onde:** Arquivo `forge/scripts/validate_equivalence.py` (novo) no repositório do Forge.
+
+        **Comando/Configuração:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Script de validação de equivalência: Streaming ≡ Batch
+
+        Compara resultados de Forge em streaming vs batch para as últimas 24 horas.
+        Gera relatório com métricas de completude, corretude e schema.
+        """
+
+        import sys
+        import json
+        from datetime import datetime, timedelta
+        from typing import Dict, List, Tuple
+        import logging
+
+        # [SUPOSIÇÃO] Usando Snowflake como DW; adaptar para BigQuery/Redshift conforme necessário
+        import snowflake.connector
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        class EquivalenceValidator:
+            def __init__(self, dw_connection_string: str):
+                """Inicializa conexão com DW."""
+                self.conn = snowflake.connector.connect(dw_connection_string)
+                self.cursor = self.conn.cursor()
+                self.report = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "period": "last_24_hours",
+                    "tables": {},
+                    "overall_status": "PASS",
+                    "errors": []
+                }
+
+            def validate_completeness(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming") -> Dict:
+                """Valida completude (row count) entre batch e streaming."""
+                logger.info(f"Validando completude: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Contar linhas no batch
+                    self.cursor.execute(f"""
+                        SELECT COUNT(*) AS row_count
+                        FROM {batch_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                    """)
+                    batch_count = self.cursor.fetchone()[0]
+                    
+                    # Contar linhas no streaming
+                    self.cursor.execute(f"""
+                        SELECT COUNT(*) AS row_count
+                        FROM {streaming_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                    """)
+                    streaming_count = self.cursor.fetchone()[0]
+                    
+                    # Calcular completude
+                    if batch_count == 0:
+                        completeness_pct = 100.0
+                        diff = 0
+                    else:
+                        completeness_pct = (streaming_count / batch_count) * 100
+                        diff = abs(batch_count - streaming_count)
+                    
+                    status = "PASS" if completeness_pct >= 99.9 else "FAIL"
+                    
+                    result = {
+                        "metric": "completeness",
+                        "batch_rows": batch_count,
+                        "streaming_rows": streaming_count,
+                        "completeness_pct": round(completeness_pct, 2),
+                        "diff_rows": diff,
+                        "diff_pct": round((diff / batch_count * 100) if batch_count > 0 else 0, 2),
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Completude: {completeness_pct:.2f}% ({diff} linhas de diferença)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar completude: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "completeness", "status": "ERROR", "error": str(e)}
+
+            def validate_correctness(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming", 
+                                    group_by_cols: List[str], agg_cols: Dict[str, str]) -> Dict:
+                """Valida corretude (valores de agregações) entre batch e streaming."""
+                logger.info(f"Validando corretude: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Construir query de agregação
+                    group_by_clause = ", ".join(group_by_cols)
+                    agg_clause_batch = ", ".join([f"{agg_func} AS {col}_{agg_func}" for col, agg_func in agg_cols.items()])
+                    agg_clause_streaming = ", ".join([f"{agg_func} AS {col}_{agg_func}" for col, agg_func in agg_cols.items()])
+                    
+                    # Query batch
+                    batch_query = f"""
+                        SELECT
+                          {group_by_clause},
+                          {agg_clause_batch}
+                        FROM {batch_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                        GROUP BY {group_by_clause}
+                        ORDER BY {group_by_clause}
+                    """
+                    
+                    # Query streaming
+                    streaming_query = f"""
+                        SELECT
+                          {group_by_clause},
+                          {agg_clause_streaming}
+                        FROM {streaming_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                        GROUP BY {group_by_clause}
+                        ORDER BY {group_by_clause}
+                    """
+                    
+                    self.cursor.execute(batch_query)
+                    batch_rows = self.cursor.fetchall()
+                    
+                    self.cursor.execute(streaming_query)
+                    streaming_rows = self.cursor.fetchall()
+                    
+                    # Comparar
+                    mismatches = 0
+                    for batch_row, streaming_row in zip(batch_rows, streaming_rows):
+                        if batch_row != streaming_row:
+                            mismatches += 1
+                            logger.warning(f"  Mismatch: {batch_row} vs {streaming_row}")
+                    
+                    correctness_pct = ((len(batch_rows) - mismatches) / len(batch_rows) * 100) if batch_rows else 100.0
+                    status = "PASS" if correctness_pct == 100.0 else "FAIL"
+                    
+                    result = {
+                        "metric": "correctness",
+                        "batch_rows": len(batch_rows),
+                        "streaming_rows": len(streaming_rows),
+                        "mismatches": mismatches,
+                        "correctness_pct": round(correctness_pct, 2),
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Corretude: {correctness_pct:.2f}% ({mismatches} mismatches)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar corretude: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "correctness", "status": "ERROR", "error": str(e)}
+
+            def validate_schema(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming") -> Dict:
+                """Valida schema (colunas e tipos) entre batch e streaming."""
+                logger.info(f"Validando schema: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Obter schema batch
+                    self.cursor.execute(f"""
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_name = '{batch_table}'
+                        ORDER BY ordinal_position
+                    """)
+                    batch_schema = {row[0]: row[1] for row in self.cursor.fetchall()}
+                    
+                    # Obter schema streaming
+                    self.cursor.execute(f"""
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_name = '{streaming_table}'
+                        ORDER BY ordinal_position
+                    """)
+                    streaming_schema = {row[0]: row[1] for row in self.cursor.fetchall()}
+                    
+                    # Comparar
+                    mismatches = []
+                    for col, type_batch in batch_schema.items():
+                        type_streaming = streaming_schema.get(col)
+                        if type_streaming != type_batch:
+                            mismatches.append(f"{col}: {type_batch} vs {type_streaming}")
+                    
+                    for col in streaming_schema:
+                        if col not in batch_schema:
+                            mismatches.append(f"{col}: missing in batch")
+                    
+                    status = "PASS" if not mismatches else "FAIL"
+                    
+                    result = {
+                        "metric": "schema",
+                        "batch_columns": len(batch_schema),
+                        "streaming_columns": len(streaming_schema),
+                        "mismatches": mismatches,
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Schema: {status} ({len(mismatches)} mismatches)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar schema: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "schema", "status": "ERROR", "error": str(e)}
+
+            def run_validation(self) -> Dict:
+                """Executa validação completa."""
+                logger.info("Iniciando validação de equivalência...")
+                
+                # Tabelas a validar
+                tables_config = {
+                    "forge_events_aggregated": {
+                        "group_by": ["hour", "tenant_id"],
+                        "agg": {"request_count": "SUM", "error_count": "SUM"}
+                    },
+                    "forge_events_by_service": {
+                        "group_by": ["hour", "tenant_id", "service_id"],
+                        "agg": {"error_count": "SUM", "request_count": "SUM"}
+                    },
+                    "forge_sla_violations": {
+                        "group_by": ["hour", "tenant_id", "service_id"],
+                        "agg": {"sla_breached": "SUM"}
+                    }
+                }
+                
+                for table_name, config in tables_config.items():
+                    logger.info(f"\nValidando tabela: {table_name}")
+                    
+                    table_report = {}
+                    
+                    # Completude
+                    completeness = self.validate_completeness(table_name, "_batch", "_streaming")
+                    table_report["completeness"] = completeness
+                    
+                    # Corretude
+                    correctness = self.validate_correctness(
+                        table_name, "_batch", "_streaming",
+                        config["group_by"], config["agg"]
+                    )
+                    table_report["correctness"] = correctness
+                    
+                    # Schema
+                    schema = self.validate_schema(table_name, "_batch", "_streaming")
+                    table_report["schema"] = schema
+                    
+                    # Status da tabela
+                    table_status = "PASS" if all(
+                        v.get("status") == "PASS" for v in table_report.values()
+                    ) else "FAIL"
+                    table_report["status"] = table_status
+                    
+                    self.report["tables"][table_name] = table_report
+                    
+                    if table_status == "FAIL":
+                        self.report["overall_status"] = "FAIL"
+                
+                logger.info("\nValidação concluída.")
+                return self.report
+
+            def save_report(self, output_file: str):
+                """Salva relatório em arquivo JSON."""
+                with open(output_file, "w") as f:
+                    json.dump(self.report, f, indent=2)
+                logger.info(f"Relatório salvo em: {output_file}")
+
+            def print_summary(self):
+                """Imprime resumo do relatório."""
+                print("\n" + "="*80)
+                print("RELATÓRIO DE EQUIVALÊNCIA: STREAMING ≡ BATCH")
+                print("="*80)
+                print(f"Timestamp: {self.report['timestamp']}")
+                print(f"Período: {self.report['period']}")
+                print(f"Status geral: {self.report['overall_status']}")
+                print()
+                
+                for table_name, table_report in self.report["tables"].items():
+                    print(f"Tabela: {table_name}")
+                    print(f"  Status: {table_report['status']}")
+                    print(f"  Completude: {table_report['completeness']['completeness_pct']}% "
+                          f"({table_report['completeness']['diff_rows']} linhas de diferença)")
+                    print(f"  Corretude: {table_report['correctness']['correctness_pct']}% "
+                          f"({table_report['correctness']['mismatches']} mismatches)")
+                    print(f"  Schema: {table_report['schema']['status']} "
+                          f"({len(table_report['schema']['mismatches'])} mismatches)")
+                    print()
+                
+                if self.report["errors"]:
+                    print("Erros:")
+                    for error in self.report["errors"]:
+                        print(f"  - {error}")
+                
+                print("="*80)
+
+        if __name__ == "__main__":
+            # [SUPOSIÇÃO] Conexão com DW via variável de ambiente
+            dw_conn_string = os.getenv("DW_CONNECTION_STRING")
+            if not dw_conn_string:
+                print("Erro: DW_CONNECTION_STRING não definida")
+                sys.exit(1)
+            
+            validator = EquivalenceValidator(dw_conn_string)
+            report = validator.run_validation()
+            
+            # Salvar relatório
+            output_file = f"equivalence_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            validator.save_report(output_file)
+            
+            # Imprimir resumo
+            validator.print_summary()
+            
+            # Retornar código de saída
+            sys.exit(0 if report["overall_status"] == "PASS" else 1)
+        ```
+
+        **Verificação:** Script criado e testável; gera relatório JSON com métricas de equivalência.
+
+        ---
+
+        ## 4. Defina orçamento de erro e gatilho de rollback
+
+        **Ação:** Formalize limites de erro aceitáveis e condições que disparam rollback automático.
+
+        **Onde:** Arquivo `forge/docs/error-budget-and-rollback.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 4.1 Orçamento de erro
+
+        **Ação:** Defina quanto de erro é aceitável antes de rollback.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Orçamento de Erro e Gatilho de Rollback
+
+        ## Orçamento de Erro (Error Budget)
+
+        ### Definição
+        Quantidade máxima de erro aceitável em uma métrica antes de disparar rollback.
+
+        ### Métricas e Orçamentos
+
+        #### 1. Completude (Completeness Error Budget)
+        **Métrica:** Percentual de eventos perdidos.
+
+        **Orçamento:**
+        ```
+        Alvo: ≥ 99.9% completude
+        Orçamento: ≤ 0.1% perda
+        Período: Por hora
+        Gatilho: Se completude < 99.9% em 2 horas consecutivas
+        ```
+
+        **Cálculo:**
+        ```python
+        completude_hora_1 = 99.85%  # ❌ Abaixo do alvo
+        completude_hora_2 = 99.88%  # ❌ Abaixo do alvo (2 consecutivas)
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 2. Corretude (Correctness Error Budget)
+        **Métrica:** Percentual de linhas com valores incorretos.
+
+        **Orçamento:**
+        ```
+        Alvo: 100% corretude
+        Orçamento: ≤ 0.1% de mismatches
+        Período: Por hora
+        Gatilho: Se corretude < 99.9% em 1 hora
+        ```
+
+        **Cálculo:**
+        ```python
+        mismatches_hora_1 = 150  # em 1M linhas = 0.015%
+        corretude = 99.985%  # ✅ Acima do alvo
+        # → Sem gatilho
+
+        mismatches_hora_2 = 2000  # em 1M linhas = 0.2%
+        corretude = 99.8%  # ❌ Abaixo do alvo
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 3. Latência (Latency Error Budget)
+        **Métrica:** Percentual de eventos que violam SLO de latência.
+
+        **Orçamento:**
+        ```
+        Alvo: p95 ≤ 120 s
+        Orçamento: ≤ 5% de eventos com latência > 120 s
+        Período: Por hora
+        Gatilho: Se > 5% de eventos violam SLO em 1 hora
+        ```
+
+        **Cálculo:**
+        ```python
+        eventos_hora_1 = 100000
+        eventos_violando_slo = 3000  # 3%
+        violacao_pct = 3%  # ✅ Abaixo do orçamento
+        # → Sem gatilho
+
+        eventos_hora_2 = 100000
+        eventos_violando_slo = 7000  # 7%
+        violacao_pct = 7%  # ❌ Acima do orçamento
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 4. Disponibilidade (Availability Error Budget)
+        **Métrica:** Percentual de tempo com erro.
+
+        **Orçamento:**
+        ```
+        Alvo: ≥ 99.5% disponibilidade
+        Orçamento: ≤ 0.5% downtime
+        Período: Por dia
+        Gatilho: Se disponibilidade < 99.0% em 1 dia
+        ```
+
+        **Cálculo:**
+        ```python
+        uptime_dia_1 = 99.2%  # ✅ Acima do alvo
+        # → Sem gatilho
+
+        uptime_dia_2 = 98.8%  # ❌ Abaixo do alvo
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        ### Resumo de Orçamentos
+
+        | Métrica | Alvo | Orçamento | Período | Gatilho |
+        |---------|------|----------|---------|---------|
+        | **Completude** | ≥ 99.9% | ≤ 0.1% perda | Por hora | < 99.9% em 2h consecutivas |
+        | **Corretude** | 100% | ≤ 0.1% mismatches | Por hora | < 99.9% em 1h |
+        | **Latência (p95)** | ≤ 120 s | ≤ 5% violação | Por hora | > 5% violação em 1h |
+        | **Disponibilidade** | ≥ 99.5% | ≤ 0.5% downtime | Por dia | < 99.0% em 1 dia |
+
+        ```
+
+        **Verificação:** Arquivo criado com orçamentos de erro documentados; gatilhos definidos.
+
+        ---
+
+        ### 4.2 Gatilho de rollback
+
+        **Ação:** Defina condições que disparam rollback automático.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Gatilhos de Rollback
+
+        ## Definição
+        Condições que, quando acionadas, disparam rollback automático do Forge de streaming para batch.
+
+        ## Gatilhos Automáticos
+
+        ### Gatilho 1: Completude Crítica
+        **Condição:** Completude < 99.9% em 2 horas consecutivas.
+
+        **Ação:**
+        1. Alertar time de on-call (Slack, PagerDuty).
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        # Pseudocódigo de monitoramento
+        def check_completeness_trigger():
+            completeness_last_2h = get_completeness_last_2_hours()
+            if all(c < 99.9 for c in completeness_last_2h):
+                alert("COMPLETENESS_CRITICAL", completeness_last_2h)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("COMPLETENESS_CRITICAL")
+        ```
+
+        ### Gatilho 2: Corretude Crítica
+        **Condição:** Corretude < 99.9% em 1 hora.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_correctness_trigger():
+            correctness_last_1h = get_correctness_last_hour()
+            if correctness_last_1h < 99.9:
+                alert("CORRECTNESS_CRITICAL", correctness_last_1h)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("CORRECTNESS_CRITICAL")
+        ```
+
+        ### Gatilho 3: Latência Crítica
+        **Condição:** > 5% de eventos com latência > 120 s em 1 hora.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 10 min para confirmação manual (latência pode ser transitória).
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_latency_trigger():
+            latency_violation_pct = get_latency_violation_pct_last_hour()
+            if latency_violation_pct > 5:
+                alert("LATENCY_CRITICAL", latency_violation_pct)
+                if not manual_override_within(minutes=10):
+                    trigger_rollback("LATENCY_CRITICAL")
+        ```
+
+        ### Gatilho 4: Disponibilidade Crítica
+        **Condição:** Disponibilidade < 99.0% em 1 dia.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 15 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_availability_trigger():
+            availability_last_24h = get_availability_last_24_hours()
+            if availability_last_24h < 99.0:
+                alert("AVAILABILITY_CRITICAL", availability_last_24h)
+                if not manual_override_within(minutes=15):
+                    trigger_rollback("AVAILABILITY_CRITICAL")
+        ```
+
+        ### Gatilho 5: Erro de Consumidor
+        **Condição:** Consumidor (Sentinel, Cerebro, Pepper) reporta erro ao ler dados do Forge.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_consumer_error_trigger():
+            consumer_errors = get_consumer_errors_last_hour()
+            if consumer_errors > 0:
+                alert("CONSUMER_ERROR", consumer_errors)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("CONSUMER_ERROR")
+        ```
+
+        ## Gatilhos Manuais
+
+        ### Gatilho Manual 1: Decisão de Negócio
+        **Condição:** Time de produto/engenharia decide que streaming não é viável.
+
+        **Ação:**
+        1. Executar rollback imediatamente.
+        2. Documentar razão em ticket.
+
+        ### Gatilho Manual 2: Incidente Crítico
+        **Condição:** Incidente crítico em produção (ex: perda de dados, corrupção).
+
+        **Ação:**
+        1. Executar rollback imediatamente.
+        2. Investigar causa raiz.
+
+        ## Resumo de Gatilhos
+
+        | Gatilho | Condição | Ação | Tempo de confirmação |
+        |---------|----------|------|----------------------|
+        | **Completude** | < 99.9% em 2h | Rollback automático | 5 min |
+        | **Corretude** | < 99.9% em 1h | Rollback automático | 5 min |
+        | **Latência** | > 5% violação em 1h | Rollback automático | 10 min |
+        | **Disponibilidade** | < 99.0% em 1 dia | Rollback automático | 15 min |
+        | **Erro de consumidor** | Erro ao ler dados | Rollback automático | 5 min |
+        | **Decisão de negócio** | Time decide | Rollback imediato | — |
+        | **Incidente crítico** | Perda/corrupção de dados | Rollback imediato | — |
+
+        ```
+
+        **Verificação:** Arquivo criado com gatilhos de rollback documentados; ações e tempos definidos.
+
+        ---
+
+        ## 5. Mapeie SLAs herdados que não podem ser quebrados
+
+        **Ação:** Identifique e formalize SLAs de consumidores que devem ser mantidos durante a migração.
+
+        **Onde:** Arquivo `forge/docs/inherited-slas.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 5.1 Coleta de SLAs herdados
+
+        **Ação:** Entreviste times de consumidores para confirmar SLAs.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLAs Herdados: Restrições que Não Podem Ser Quebradas
+
+        ## Definição
+        SLAs herdados são compromissos de nível de serviço que o Forge deve manter 
+        durante a migração de batch para streaming.
+
+        ## SLAs por Consumidor
+
+        ### 1. Sentinel (Dashboards e Alertas)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Dados disponíveis a cada 60 min
+        Disponibilidade: 99.0% (uptime)
+        Completude: 99.5% (sem perda de dados)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Dados disponíveis a cada 30 s (SLA de 2 min p95)
+        Disponibilidade: 99.5% (uptime) — AUMENTADO
+        Completude: 99.9% (sem perda de dados) — AUMENTADO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Dashboards ficam desatualizados.
+        - Alertas não disparam no tempo correto.
+        - Clientes não conseguem monitorar aplicações em tempo real.
+        - **Severidade:** CRÍTICA
+
+        #### Validação necessária
+        - [ ] Sentinel consegue processar dados a cada 30 s?
+        - [ ] Alertas disparam corretamente com latência de 2 min?
+        - [ ] Dashboard não fica sobrecarregado com atualizações frequentes?
+
+        ---
+
+        ### 2. Cerebro (Indexação de Logs)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Índice atualizado a cada 60 min
+        Disponibilidade: 99.0% (uptime)
+        Completude: 99.5% (sem perda de eventos)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Índice atualizado a cada 30 s (SLA de 2 min p95)
+        Disponibilidade: 99.5% (uptime) — AUMENTADO
+        Completude: 99.9% (sem perda de eventos) — AUMENTADO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Logs não aparecem em buscas em tempo real.
+        - Investigação de incidentes fica mais lenta.
+        - Clientes não conseguem debugar problemas rapidamente.
+        - **Severidade:** ALTA
+
+        #### Validação necessária
+        - [ ] Cerebro consegue ingerir dados a cada 30 s?
+        - [ ] Índice não fica fragmentado com atualizações frequentes?
+        - [ ] Queries de busca não ficam mais lentas?
+
+        ---
+
+        ### 3. Pepper (Billing)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Relatório roda 1× por dia (02:00 UTC)
+        Disponibilidade: 99.9% (uptime)
+        Completude: 99.9% (sem perda de eventos = sem perda de receita)
+        Precisão: 100% (sem duplicatas, sem undercharging/overcharging)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Relatório roda 1× por dia (02:00 UTC) — SEM MUDANÇA
+        Disponibilidade: 99.9% (uptime) — MANTIDO
+        Completude: 99.9% (sem perda de eventos) — MANTIDO
+        Precisão: 100% (sem duplicatas, sem undercharging/overcharging) — CRÍTICO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Clientes são faturados incorretamente (overcharging) ou não faturados (undercharging).
+        - Perda de receita ou disputa com clientes.
+        - Conformidade regulatória em risco.
+        - **Severidade:** CRÍTICA
+
+        #### Validação necessária
+        - [ ] Query de billing deduplica corretamente?
+        - [ ] Completude é ≥ 99.9% no momento do relatório (02:00 UTC)?
+        - [ ] Reconciliação detecta e corrige duplicatas?
+        - [ ] Teste de billing com dados reais antes de produção?
+
+        ---
+
+        ## Resumo de SLAs Herdados
+
+        | Consumidor | Métrica | SLA Atual | SLA Herdado | Mudança | Severidade |
+        |-----------|---------|-----------|------------|---------|-----------|
+        | **Sentinel** | Latência | 60 min | 2 min (p95) | ↓ 30× | CRÍTICA |
+        | | Disponibilidade | 99.0% | 99.5% | ↑ 0.5% | ALTA |
+        | | Completude | 99.5% | 99.9% | ↑ 0.4% | ALTA |
+        | **Cerebro** | Latência | 60 min | 2 min (p95) | ↓ 30× | ALTA |
+        | | Disponibilidade | 99.0% | 99.5% | ↑ 0.5% | ALTA |
+        | | Completude | 99.5% | 99.9% | ↑ 0.4% | ALTA |
+        | **Pepper** | Latência | 60 min | 60 min | — | — |
+        | | Disponibilidade | 99.9% | 99.9% | — | CRÍTICA |
+        | | Completude | 99.9% | 99.9% | — | CRÍTICA |
+        | | Precisão | 100% | 100% | — | CRÍTICA |
+
+        ## Validação de SLAs Herdados
+
+        ### Checklist de Validação
+
+        - [ ] **Sentinel**
+          - [ ] Consegue processar dados a cada 30 s?
+          - [ ] Alertas disparam corretamente com latência de 2 min?
+          - [ ] Dashboard não fica sobrecarregado?
+          - [ ] Queries de agregação lidam com duplicatas?
+
+        - [ ] **Cerebro**
+          - [ ] Consegue ingerir dados a cada 30 s?
+          - [ ] Índice não fica fragmentado?
+          - [ ] Queries de busca não ficam mais lentas?
+          - [ ] Deduplicação funciona corretamente?
+
+        - [ ] **Pepper**
+          - [ ] Query de billing deduplica corretamente?
+          - [ ] Completude é ≥ 99.9% no momento do relatório?
+          - [ ] Reconciliação detecta duplicatas?
+          - [ ] Teste de billing com dados reais passou?
+
+        ### Teste de Regressão
+
+        Antes de cada etapa de migração, executar:
+
+        ```bash
+        # Teste de Sentinel
+        ./tests/test_sentinel_compatibility.sh
+
+        # Teste de Cerebro
+        ./tests/test_cerebro_compatibility.sh
+
+        # Teste de Pepper
+        ./tests/test_pepper_billing_accuracy.sh
+        ```
+
+        ```
+
+        **Verificação:** Arquivo criado com SLAs herdados documentados; validações listadas.
+
+        ---
+
+        ### 5.2 Validação de SLAs herdados com consumidores
+
+        **Ação:** Confirme SLAs com times de consumidores.
+
+        **Comando/Configuração:**
+
+        ```bash
+        #!/bin/bash
+        # Script de validação de SLAs herdados com consumidores
+
+        echo "=== Validação de SLAs Herdados ==="
+        echo ""
+
+        # Sentinel
+        echo "1. Sentinel (Dashboards e Alertas)"
+        echo "   Contato: [SUPOSIÇÃO] slack #sentinel-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência esperado para dashboards?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Conseguem lidar com dados a cada 30 s?"
+        echo "   - Conseguem lidar com possíveis duplicatas?"
+        echo ""
+
+        # Cerebro
+        echo "2. Cerebro (Indexação de Logs)"
+        echo "   Contato: [SUPOSIÇÃO] slack #cerebro-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência esperado para indexação?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Conseguem ingerir dados a cada 30 s?"
+        echo "   - Conseguem lidar com possíveis duplicatas?"
+        echo ""
+
+        # Pepper
+        echo "3. Pepper (Billing)"
+        echo "   Contato: [SUPOSIÇÃO] slack #pepper-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência para relatório de billing?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Qual é o SLA de precisão (sem duplicatas)?"
+        echo "   - Conseguem validar dados antes de faturar?"
+        echo ""
+
+        echo "=== Próximos passos ==="
+        echo "1. Enviar questionário para cada time consumidor."
+        echo "2. Agendar reunião de alinhamento."
+        echo "3. Documentar respostas em forge/docs/inherited-slas.md."
+        echo "4. Criar testes de regressão para cada SLA."
+        ```
+
+        **Verificação:** Script criado; questionário enviado para consumidores.
+
+        ---
+
+        ## 6. Crie documento de decisão arquitetural (ADR)
+
+        **Ação:** Formalize todas as decisões de SLOs, semântica e equivalência em um ADR.
+
+        **Onde:** Arquivo `forge/docs/adr/0002-streaming-slos-and-semantics.md` (novo) no repositório do Forge.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # ADR 0002: SLOs, Semântica de Entrega e Critérios de Equivalência para Forge Streaming
+
+        ## Status
+        PROPOSED (aguardando aprovação de stakeholders)
+
+        ## Contexto
+        O Forge está migrando de batch (60 min) para streaming (30 s) para reduzir latência de observabilidade.
+        Precisamos formalizar SLOs, semântica de entrega e critérios de equivalência para validar que 
+        streaming é seguro e equivalente ao batch.
+
+        ## Decisão
+
+        ### 1. SLOs do Forge Streaming
+        - **Frescor (p95):** 120 s (2 min) — 52× mais rápido que batch
+        - **Completude:** ≥ 99.9% — sem perda de dados
+        - **Disponibilidade:** ≥ 99.5% — ~3.6 horas de downtime/mês
+        - **RTO (falha de job):** ≤ 5 min — recuperação rápida
+        - **RPO:** 0 eventos — sem perda de dados
+
+        ### 2. Semântica de Entrega
+        - **Escolhida:** At-Least-Once (ALO) com idempotência
+        - **Justificativa:** Completude ≥ 99.9%, latência baixa, custo baixo
+        - **Implementação:** Checkpoint a cada 30 s + deduplicação no DW
+
+        ### 3. Critérios de Equivalência
+        - **Completude:** ≥ 99.9% (diferença ≤ 0.1% das linhas por hora)
+        - **Corretude:** 100% (sem mismatches em agregações)
+        - **Schema:** 100% idêntico (mesmas colunas, tipos, ordem)
+        - **Validação:** Diária, comparando batch vs streaming das últimas 24 horas
+
+        ### 4. Orçamento de Erro
+        - **Completude:** ≤ 0.1% perda → Gatilho se < 99.9% em 2h consecutivas
+        - **Corretude:** ≤ 0.1% mismatches → Gatilho se < 99.9% em 1h
+        - **Latência:** ≤ 5% violação → Gatilho se > 5% violação em 1h
+        - **Disponibilidade:** ≤ 0.5% downtime → Gatilho se < 99.0% em 1 dia
+
+        ### 5. Gatilhos de Rollback
+        - **Automático:** Completude, corretude, latência, disponibilidade críticas
+        - **Manual:** Decisão de negócio, incidente crítico
+        - **Tempo de confirmação:** 5–15 min antes de rollback automático
+
+        ### 6. SLAs Herdados
+        - **Sentinel:** Latência 2 min (p95), disponibilidade 99.5%, completude 99.9%
+        - **Cerebro:** Latência 2 min (p95), disponibilidade 99.5%, completude 99.9%
+        - **Pepper:** Latência 60 min (sem mudança), disponibilidade 99.9%, completude 99.9%, precisão 100%
+
+        ## Consequências
+
+        ### Positivas
+        - ✅ Latência reduzida 52× (105 min → 2 min)
+        - ✅ Completude aumentada (99.5% → 99.9%)
+        - ✅ Disponibilidade aumentada (99.0% → 99.5%)
+        - ✅ Recuperação mais rápida (60 min → 5 min)
+        - ✅ Sem perda de dados (RPO = 0)
+
+        ### Negativas
+        - ❌ Complexidade aumentada (streaming vs batch)
+        - ❌ Possíveis duplicatas em reprocessamento (mitigado com idempotência)
+        - ❌ Custo de operação pode aumentar (monitoramento, alertas)
+        - ❌ Consumidores precisam lidar com duplicatas
+
+        ### Mitigações
+        - Implementar deduplicação no DW (INSERT ... ON CONFLICT DO NOTHING)
+        - Validação diária de equivalência (script automatizado)
+        - Gatilhos automáticos de rollback (sem intervenção manual)
+        - Testes de regressão com consumidores (Sentinel, Cerebro, Pepper)
+
+        ## Aprovação Necessária
+        - [ ] Tech Lead do Forge
+        - [ ] Tech Lead de Sentinel
+        - [ ] Tech Lead de Cerebro
+        - [ ] Tech Lead de Pepper
+        - [ ] VP de Engenharia
+
+        ## Referências
+        - Etapa 1: Inventário e Baseline
+        - Etapa 2: Metas, SLOs e Critérios de Equivalência (este documento)
+        - Etapa 3: Arquitetura de Streaming
+        ```
+
+        **Verificação:** ADR criado; pronto para revisão e aprovação.
+
+        ---
+
+        ## X. Ponto de não-retorno
+
+        **Não há ponto de não-retorno nesta etapa.** Todos os passos são de documentação e formalização de decisões.
+
+        Nenhuma mudança foi feita em produção. Todas as decisões podem ser revisadas e alteradas antes da Etapa 3 (prototipagem).
+
+        ---
+
+        ## Y. Rollback
+
+        **Não aplicável.** Esta etapa não modifica nenhum sistema.
+
+        ---
+
+        ## Z. Critérios de conclusão
+
+        - [ ] **SLOs:** Frescor (p95 = 120 s), completude (≥ 99.9%), disponibilidade (≥ 99.5%), RTO (≤ 5 min), RPO (0 eventos) documentados.
+        - [ ] **Semântica:** At-Least-Once com idempotência escolhida e justificada; implicações por consumidor documentadas.
+        - [ ] **Equivalência:** Critérios de completude (≥ 99.9%), corretude (100%), schema (100%) definidos; script de validação criado.
+        - [ ] **Orçamento de erro:** Limites de erro (completude, corretude, latência, disponibilidade) documentados; gatilhos definidos.
+        - [ ] **Gatilhos de rollback:** Automáticos (5 gatilhos) e manuais (2 gatilhos) documentados; tempos de confirmação definidos.
+        - [ ] **SLAs herdados:** Sentinel, Cerebro, Pepper mapeados; validações listadas; confirmação com consumidores iniciada.
+        - [ ] **ADR:** Documento de decisão arquitetural criado; pronto para aprovação.
+        - [ ] **Suposições:** Todas as suposições marcadas com `[SUPOSIÇÃO]` e justificadas.
+        - [ ] **Dados faltantes:** Lista de dados que faltam para confirmar/derrubar escolhas futuras.
+
+        ---
+
+        ## W. Riscos e mitigação
+
+        | Risco | Probabilidade | Impacto | Mitigação |
+        |-------|---------------|--------|-----------|
+        | SLOs são muito agressivos (2 min p95 não é alcançável) | Média | Alto | Validar com protótipo (Etapa 3); ajustar SLOs se necessário |
+        | Consumidores não conseguem lidar com duplicatas | Média | Alto | Testar com dados reais; implementar deduplicação em consumidores |
+        | Orçamento de erro é muito restritivo (gatilhos disparam frequentemente) | Média | Médio | Ajustar orçamentos após prototipagem; validar com dados históricos |
+        | SLAs herdados não são confirmados com consumidores | Baixa | Alto | Enviar questionário agora; agendar reunião de alinhamento |
+        | Gatilhos de rollback não funcionam corretamente | Baixa | Alto | Testar gatilhos em staging; validar com simulação de falhas |
+        | Custo de operação aumenta significativamente | Média | Médio | Estimar custo na Etapa 3; comparar com batch |
+        | Equivalência não é alcançada (streaming ≠ batch) | Média | Alto | Investigar causa raiz; ajustar transformações se necessário |
+
+        ---
+
+        ## Dados faltantes e confirmações necessárias
+
+        ### Dados que faltam:
+
+        1. **Confirmação de SLAs com consumidores:** Sentinel, Cerebro e Pepper confirmaram os SLOs propostos?
+        2. **Capacidade de Sentinel:** Consegue processar dados a cada 30 s sem overhead?
+        3. **Capacidade de Cerebro:** Consegue ingerir dados a cada 30 s sem fragmentação?
+        4. **Capacidade de Pepper:** Query de billing consegue deduplicar corretamente?
+        5. **Custo de streaming:** Qual é o custo estimado de streaming vs batch?
+        6. **Retenção no Relay:** Quantos dias de eventos estão disponíveis para replay?
+        7. **Tamanho de estado por tenant:** Qual é o maior tenant em termos de volume?
+
+        ### Confirmações que derrubariam/validariam escolhas futuras:
+
+        - Se **SLO de 2 min p95 não for alcançável**, aumentar para 5 min ou 10 min.
+        - Se **consumidores não conseguem lidar com duplicatas**, usar exactly-once em vez de at-least-once.
+        - Se **custo de streaming > 2× custo de batch**, reconsiderar viabilidade econômica.
+        - Se **retenção no Relay < 24h**, implementar buffer local para replay.
+        - Se **tamanho de estado por tenant > 10 GB**, usar state store distribuído.
+
+        ---
+
+        ## Suposições marcadas
+
+        | # | Suposição | Razão | Confirmação necessária |
+        |---|-----------|-------|------------------------|
+        | [SUPOSIÇÃO-1] | SLO de 2 min p95 é alcançável com streaming | Baseado em latência de batch (105 min) | Validar com protótipo (Etapa 3) |
+        | [SUPOSIÇÃO-2] | At-Least-Once com idempotência é suficiente | Padrão em streaming; sem overhead de 2-phase commit | Validar com consumidores |
+        | [SUPOSIÇÃO-3] | Deduplicação no DW é simples (INSERT ... ON CONFLICT) | Padrão em SQL; suportado por Snowflake, BigQuery, Redshift | Confirmar com time de DW |
+        | [SUPOSIÇÃO-4] | Consumidores conseguem lidar com duplicatas | Queries podem usar DISTINCT ou GROUP BY | Testar com dados reais |
+        | [SUPOSIÇÃO-5] | Orçamento de erro é realista (0.1% completude, 0.1% corretude) | Baseado em SLA de 99.9% | Validar com dados históricos |
+        | [SUPOSIÇÃO-6] | Gatilhos de rollback funcionam corretamente | Implementação simples com alertas e confirmação manual | Testar em staging |
+        | [SUPOSIÇÃO-7] | SLAs herdados são confirmados com consumidores | Assumindo comunicação com Sentinel, Cerebro, Pepper | Enviar questionário agora |
+        | [SUPOSIÇÃO-8] | Pepper consegue validar dados antes de faturar | Assumindo query de billing com deduplicação | Testar com dados reais |
+
+        ---
+
+        ## Próximos passos (Etapa 3)
+
+        Após conclusão desta etapa, os SLOs e critérios de equivalência alimentarão:
+
+        - **Etapa 3:** Arquitetura de streaming (Kafka Streams, Flink, Spark Structured Streaming).
+        - **Etapa 4:** Prototipagem de um bloco de 30 s com validação de SLOs.
+        - **Etapa 5:** Validação de equivalência (batch vs streaming).
+        - **Etapa 6–10:** Migração gradual com canary, validação de consumidores, rollback.
+      INSUMO_ETAPA_5: |
+        # Etapa 5 de 10: Escrita Incremental no Data Warehouse do Forge
+
+        **Depende de:** Etapa 4.
+
+        ---
+
+        ## 0. Pré-requisitos
+
+        - [ ] Código de transformação streaming implementado (Etapa 4: `streaming_transform.py`)
+        - [ ] Código de transformação batch implementado (Etapa 4: `batch_transform_anomalies.py`)
+        - [ ] Acesso ao DW (Parquet em `/data/forge/` ou equivalente SQL)
+        - [ ] Schema das 11 tabelas de saída (by_service, aggregated, by_version, percentiles, billing_events, anomalies, sla_violations, behavior_changes, cerebro, error_rates, enriched)
+        - [ ] Acesso ao cluster Spark em staging
+        - [ ] Acesso a logs de escrita do batch atual (últimos 30 dias) para medir tamanho de arquivo e frequência de escrita
+        - [ ] Configuração atual de particionamento (ex: `partitionBy("hour")`)
+        - [ ] Política de retenção de dados no DW (ex: 90 dias)
+        - [ ] Custo atual de armazenamento e consulta (ex: $/GB/mês, $/query)
+        - [ ] Ferramentas: editor de código, SQL client, `spark-submit`, `git`, planilha colaborativa
+        - [ ] Permissão para criar branches de desenvolvimento e PRs no repositório
+        - [ ] Contato técnico confirmado em Sentinel, Cerebro, Pepper para validar leitura durante escrita
+        - [ ] Acesso a métricas de performance do DW (latência de query, tamanho de arquivo, compactação)
+
+        ---
+
+        ## 1. Defina estratégia de escrita incremental por tabela
+
+        **Ação:** Escolha entre append, upsert/merge ou staging+merge para cada tabela.
+
+        **Onde:** Arquivo `forge/config/write-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Escrita Incremental — Forge Streaming
+
+        ## Definições
+        - **Append:** Adicionar novos dados sem modificar existentes (mais rápido, sem deduplicação)
+        - **Upsert/Merge:** Atualizar linhas existentes ou inserir novas (mais lento, garante unicidade)
+        - **Staging + Merge:** Escrever em tabela temporária, depois fazer merge (mais seguro, mais lento)
+
+        ## Análise por Tabela
+
+        ### Tabelas de Agregação (by_service, aggregated, by_version, percentiles)
+        **Características:**
+        - Chave natural: `(window_start, window_end, tenant_id, [service_id], [version])`
+        - Modo de saída: `update` (eventos atrasados podem atualizar linhas já escritas)
+        - Frequência de escrita: A cada 30 s
+        - Tamanho de linha: ~200 bytes
+
+        **Problema:** Modo `update` significa que a mesma chave pode ser escrita múltiplas vezes (com valores diferentes) durante a janela.
+
+        **Exemplo:**
+        ```
+        Tempo 0:00–0:30 (janela 1)
+        - 0:15: Escreve (window_1, tenant_1, service_1, total=100, count=10)
+        - 0:25: Evento atrasado chega, escreve (window_1, tenant_1, service_1, total=110, count=11)
+        - 0:35: Janela fecha, escreve (window_1, tenant_1, service_1, total=115, count=12) [final]
+        ```
+
+        **Estratégia:** **Upsert/Merge**
+        - Usar `MERGE INTO` (SQL) ou `foreachBatch` com deduplicação
+        - Deduplicar por chave natural antes de escrever
+        - Garantir que última escrita (após watermark) é a final
+
+        **Implementação:**
+        ```python
+        # Opção 1: Usar foreachBatch com deduplicação
+        def merge_aggregation(df, batch_id, table_name, key_cols):
+            """Merge com deduplicação por chave natural"""
+            # Deduplicar: manter última linha por chave
+            df_deduplicated = df.dropDuplicates(key_cols)
+            # Escrever com merge
+            df_deduplicated.write.mode("overwrite") \
+                .option("mergeSchema", "true") \
+                .parquet(f"/data/forge/{table_name}")
+            print(f"Batch {batch_id}: {df_deduplicated.count()} linhas escritas")
+
+        # Usar em writeStream
+        query = df_aggregated.writeStream \
+            .foreachBatch(lambda df, batch_id: merge_aggregation(df, batch_id, "aggregated", ["window_start", "window_end", "tenant_id"])) \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        **Opção 2: Usar Delta Lake (se disponível)**
+        ```python
+        # Delta Lake suporta MERGE nativamente
+        query = df_aggregated.writeStream \
+            .format("delta") \
+            .mode("append") \
+            .option("mergeSchema", "true") \
+            .option("checkpointLocation", "/data/forge/checkpoint/aggregated") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+
+        # Depois, usar MERGE para deduplicação
+        spark.sql("""
+        MERGE INTO delta.`/data/forge/aggregated` t
+        USING (SELECT * FROM delta.`/data/forge/aggregated_staging`) s
+        ON t.window_start = s.window_start 
+        AND t.window_end = s.window_end 
+        AND t.tenant_id = s.tenant_id
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """)
+        ```
+
+        **Validação:**
+        - [ ] Cada chave natural aparece no máximo 1× na saída
+        - [ ] Valores são os mais recentes (após watermark)
+        - [ ] Nenhuma linha é perdida
+
+        ---
+
+        ### Tabela de Billing (billing_events)
+        **Características:**
+        - Chave natural: `(day, tenant_id)`
+        - Modo de saída: `update` (eventos atrasados podem atualizar linhas já escritas)
+        - Frequência de escrita: A cada 1 hora
+        - Tamanho de linha: ~100 bytes
+        - **Crítico:** Billing não pode ter duplicatas ou perdas
+
+        **Estratégia:** **Staging + Merge**
+        - Escrever em tabela de staging (`billing_events_staging`)
+        - Fazer merge com tabela principal (`billing_events`) 1× por dia (antes do relatório)
+        - Garantir deduplicação por `event_id` antes de contar
+
+        **Implementação:**
+        ```python
+        def merge_billing(df, batch_id):
+            """Merge com deduplicação para billing"""
+            # Deduplicar por (day, tenant_id)
+            df_deduplicated = df.dropDuplicates(["day_start", "tenant_id"])
+            # Escrever em staging
+            df_deduplicated.write.mode("append") \
+                .parquet("/data/forge/billing_events_staging")
+            print(f"Batch {batch_id}: {df_deduplicated.count()} linhas escritas em staging")
+
+        query = df_billing.writeStream \
+            .foreachBatch(lambda df, batch_id: merge_billing(df, batch_id)) \
+            .outputMode("update") \
+            .trigger(processingTime="1 hour") \
+            .start()
+
+        # Merge diário (02:00 UTC, antes do relatório)
+        def daily_billing_merge():
+            """Merge diário de staging para principal"""
+            spark.sql("""
+            MERGE INTO parquet.`/data/forge/billing_events` t
+            USING parquet.`/data/forge/billing_events_staging` s
+            ON t.day_start = s.day_start AND t.tenant_id = s.tenant_id
+            WHEN MATCHED THEN UPDATE SET 
+                unique_event_count = s.unique_event_count,
+                total_event_count = s.total_event_count
+            WHEN NOT MATCHED THEN INSERT *
+            """)
+            # Limpar staging
+            spark.sql("DELETE FROM parquet.`/data/forge/billing_events_staging`")
+        ```
+
+        **Validação:**
+        - [ ] Staging é limpo após merge
+        - [ ] Nenhuma duplicata em billing_events
+        - [ ] Completude ≥ 99.9%
+
+        ---
+
+        ### Tabela de Anomalias (anomalies)
+        **Características:**
+        - Chave natural: `(window_start, tenant_id, anomaly_id)`
+        - Modo de saída: Batch (1× por hora)
+        - Frequência de escrita: A cada 1 hora
+        - Tamanho de linha: ~300 bytes
+
+        **Estratégia:** **Append com Deduplicação**
+        - Deduplicar por `anomaly_id` antes de escrever
+        - Usar `dropDuplicates` para remover duplicatas de reprocessamento
+        - Append é seguro porque anomalias são imutáveis (uma vez detectada, não muda)
+
+        **Implementação:**
+        ```python
+        def write_anomalies(df_anomalies):
+            """Escrever anomalias com deduplicação"""
+            # Deduplicar por anomaly_id
+            df_deduplicated = df_anomalies.dropDuplicates(["anomaly_id"])
+            # Append
+            df_deduplicated.write.mode("append") \
+                .parquet("/data/forge/anomalies")
+            print(f"{df_deduplicated.count()} anomalias escritas")
+        ```
+
+        **Validação:**
+        - [ ] Cada `anomaly_id` aparece no máximo 1× na saída
+        - [ ] Nenhuma anomalia é perdida
+
+        ---
+
+        ### Tabela de SLA Violations (sla_violations)
+        **Características:**
+        - Chave natural: `(window_start, tenant_id, service_id, violation_id)`
+        - Modo de saída: Batch (1× por hora)
+        - Frequência de escrita: A cada 1 hora
+        - Tamanho de linha: ~250 bytes
+
+        **Estratégia:** **Append com Deduplicação**
+        - Idêntica à tabela de anomalias
+        - Deduplicar por `violation_id`
+
+        ---
+
+        ### Tabela de Comportamento (behavior_changes)
+        **Características:**
+        - Chave natural: `(window_start, tenant_id, change_id)`
+        - Modo de saída: Batch (1× por dia)
+        - Frequência de escrita: A cada 1 dia
+        - Tamanho de linha: ~300 bytes
+
+        **Estratégia:** **Append com Deduplicação**
+        - Idêntica às tabelas de anomalias e SLA violations
+        - Deduplicar por `change_id`
+
+        ---
+
+        ### Tabela de Exportação Cerebro (cerebro)
+        **Características:**
+        - Chave natural: `event_id`
+        - Modo de saída: Append (eventos são imutáveis)
+        - Frequência de escrita: A cada 30 s
+        - Tamanho de linha: ~500 bytes
+        - **Nota:** Escrita é para Kafka, não para Parquet
+
+        **Estratégia:** **Append com Deduplicação**
+        - Deduplicar por `event_id` antes de enviar para Kafka
+        - Kafka garante que cada `event_id` é processado pelo menos 1×
+        - Consumidor (Cerebro) deve deduplicar por `event_id`
+
+        **Implementação:**
+        ```python
+        def write_cerebro(df_cerebro, batch_id):
+            """Escrever para Cerebro com deduplicação"""
+            # Deduplicar por event_id
+            df_deduplicated = df_cerebro.dropDuplicates(["event_id"])
+            # Escrever para Kafka
+            df_deduplicated.write.format("kafka") \
+                .option("kafka.bootstrap.servers", "<relay-broker>") \
+                .option("topic", "forge-events-indexed") \
+                .mode("append") \
+                .save()
+            print(f"Batch {batch_id}: {df_deduplicated.count()} eventos enviados para Cerebro")
+
+        query = df_for_cerebro.writeStream \
+            .foreachBatch(lambda df, batch_id: write_cerebro(df, batch_id)) \
+            .outputMode("append") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        ---
+
+        ## Resumo de Estratégia de Escrita
+
+        | Tabela | Chave Natural | Modo | Frequência | Estratégia | Dedup? |
+        |--------|---------------|------|-----------|-----------|--------|
+        | by_service | window + tenant + service | update | 30 s | Upsert/Merge | Sim |
+        | aggregated | window + tenant | update | 30 s | Upsert/Merge | Sim |
+        | by_version | window + tenant + service + version | update | 30 s | Upsert/Merge | Sim |
+        | percentiles | window + tenant | update | 30 s | Upsert/Merge | Sim |
+        | billing_events | day + tenant | update | 1 h | Staging + Merge | Sim |
+        | anomalies | window + tenant + anomaly_id | append | 1 h | Append + Dedup | Sim |
+        | sla_violations | window + tenant + service + violation_id | append | 1 h | Append + Dedup | Sim |
+        | behavior_changes | window + tenant + change_id | append | 1 d | Append + Dedup | Sim |
+        | cerebro | event_id | append | 30 s | Append + Dedup (Kafka) | Sim |
+        | error_rates | window + tenant + service | update | 30 s | Upsert/Merge | Sim |
+        | enriched | event_id | append | 30 s | Append + Dedup | Sim |
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que estratégia está documentada
+        grep -E "Estratégia:|Implementação:" forge/config/write-strategy.md | wc -l
+        # Esperado: > 20 linhas
+        ```
+
+        ---
+
+        ## 2. Defina política de particionamento por hora com janelas abertas
+
+        **Ação:** Defina como manter partições coerentes enquanto a hora está aberta e quando declarar "fechada".
+
+        **Onde:** Arquivo `forge/config/partitioning-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Particionamento — Janelas Abertas e Fechadas
+
+        ## Problema
+        No batch (60 min), a partição da hora é fechada quando o lote termina.
+        Em streaming (30 s), a hora está aberta por 60 min, e eventos atrasados podem chegar até 105 s após o fim da janela.
+
+        **Exemplo:**
+        ```
+        Hora 10:00–11:00
+        - 10:00:00: Janela abre
+        - 10:30:00: Primeira escrita (eventos 10:00–10:30)
+        - 11:00:00: Janela fecha (watermark = 11:00:45)
+        - 11:01:45: Último evento atrasado chega (watermark = 11:01:45)
+        - 11:02:00: Partição é declarada "fechada"
+        ```
+
+        ## Estratégia: Particionamento por Hora + Marcador de Fechamento
+
+        ### Estrutura de Partição
+        ```
+        /data/forge/aggregated/
+        ├── hour=2024-01-15-10/
+        │   ├── part-00000.parquet
+        │   ├── part-00001.parquet
+        │   └── _CLOSED  # Marcador de fechamento
+        ├── hour=2024-01-15-11/
+        │   ├── part-00000.parquet
+        │   └── (ainda aberta, sem _CLOSED)
+        ```
+
+        ### Definição de "Fechada"
+        Uma partição é declarada **fechada** quando:
+        1. Watermark passou do fim da hora + allowed lateness
+        2. Nenhum novo evento pode chegar para essa hora
+        3. Arquivo marcador `_CLOSED` é criado
+
+        **Cálculo:**
+        ```
+        Hora: 10:00–11:00
+        Watermark: 11:00:45 (45 s após fim da hora)
+        Allowed lateness: 60 s
+        Fechamento: 11:01:45 (watermark + allowed lateness)
+        Marcador: Criar _CLOSED em 11:02:00
+        ```
+
+        ### Implementação em Spark Structured Streaming
+
+        ```python
+        def close_partition_if_ready(df, batch_id, hour_col="window_start"):
+            """Verificar se partição deve ser fechada"""
+            from datetime import datetime, timedelta
+            import os
+            
+            # Obter hora mínima no batch
+            min_hour = df.agg({hour_col: "min"}).collect()[0][0]
+            
+            if min_hour is None:
+                return
+            
+            # Calcular tempo de fechamento
+            hour_end = min_hour + timedelta(hours=1)
+            watermark_time = hour_end + timedelta(seconds=45)
+            close_time = watermark_time + timedelta(seconds=60)
+            
+            # Verificar se agora > close_time
+            now = datetime.utcnow()
+            if now > close_time:
+                # Criar marcador de fechamento
+                hour_str = min_hour.strftime("%Y-%m-%d-%H")
+                marker_path = f"/data/forge/aggregated/hour={hour_str}/_CLOSED"
+                
+                # Criar arquivo vazio
+                os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+                with open(marker_path, "w") as f:
+                    f.write(f"Closed at {now.isoformat()}\n")
+                
+                print(f"Partição {hour_str} fechada")
+
+        # Usar em writeStream
+        query = df_aggregated.writeStream \
+            .foreachBatch(lambda df, batch_id: close_partition_if_ready(df, batch_id)) \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        ### Alternativa: Usar Tabela de Metadados
+
+        Se o sistema de arquivos não suporta marcadores, usar tabela de metadados:
+
+        ```python
+        # Tabela de metadados: /data/forge/partition_metadata
+        # Schema: hour (string), status (string: "open" | "closed"), closed_at (timestamp)
+
+        def update_partition_status(spark, hour_str, status):
+            """Atualizar status de partição"""
+            spark.sql(f"""
+            INSERT INTO parquet.`/data/forge/partition_metadata`
+            VALUES ('{hour_str}', '{status}', current_timestamp())
+            """)
+
+        # Verificar se partição está fechada
+        def is_partition_closed(spark, hour_str):
+            result = spark.sql(f"""
+            SELECT status FROM parquet.`/data/forge/partition_metadata`
+            WHERE hour = '{hour_str}' AND status = 'closed'
+            LIMIT 1
+            """).collect()
+            return len(result) > 0
+        ```
+
+        ---
+
+        ## Implicações para Consumidores
+
+        ### Sentinel (Dashboards)
+        - Queries devem verificar se partição está fechada antes de usar dados
+        - Dados de partição aberta podem ser atualizados retroativamente
+        - Usar `WHERE hour < current_hour()` para dados finais
+
+        **Query segura:**
+        ```sql
+        SELECT tenant_id, service_id, SUM(total_value) as total
+        FROM aggregated
+        WHERE hour < date_trunc('hour', current_timestamp())  -- Apenas partições fechadas
+        GROUP BY tenant_id, service_id
+        ```
+
+        ### Cerebro (Indexação)
+        - Índice pode ter duplicatas de eventos em reprocessamento
+        - Indexador deve deduplicar por `event_id`
+        - Usar `_CLOSED` para saber quando índice está completo
+
+        ### Pepper (Billing)
+        - Relatório roda 1× por dia (02:00 UTC)
+        - Nesse horário, todas as partições de dias anteriores estão fechadas
+        - Usar `WHERE day < current_date()` para dados finais
+
+        ---
+
+        ## Validação
+
+        - [ ] Partições são criadas por hora
+        - [ ] Marcador `_CLOSED` é criado após allowed lateness
+        - [ ] Consumidores conseguem verificar se partição está fechada
+        - [ ] Dados de partição aberta podem ser atualizados
+        - [ ] Dados de partição fechada são imutáveis
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que particionamento está documentado
+        grep -E "Fechamento:|Implementação:|Validação:" forge/config/partitioning-strategy.md | wc -l
+        # Esperado: > 15 linhas
+        ```
+
+        ---
+
+        ## 3. Implemente deduplicação e idempotência de escrita
+
+        **Ação:** Crie código para garantir que reprocessamento não cria duplicatas.
+
+        **Onde:** Arquivo `forge/jobs/write_deduplication.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Deduplicação e Idempotência de Escrita
+        Garante que reprocessamento não cria duplicatas.
+        """
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, row_number, max as spark_max, min as spark_min
+        )
+        from pyspark.sql.window import Window
+        import logging
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        class WriteDeduplication:
+            """Estratégias de deduplicação para diferentes tipos de tabelas"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            # ========== Deduplicação por Chave Natural ==========
+            def deduplicate_by_key(self, df, key_cols, order_by_col=None):
+                """
+                Deduplicar por chave natural, mantendo última linha.
+                
+                Args:
+                    df: DataFrame
+                    key_cols: Lista de colunas que formam chave natural
+                    order_by_col: Coluna para ordenar (ex: timestamp). Se None, usa dropDuplicates.
+                
+                Returns:
+                    DataFrame deduplicated
+                """
+                self.logger.info(f"Deduplicando por chave: {key_cols}")
+                
+                if order_by_col is None:
+                    # Usar dropDuplicates (mais rápido, mas não garante qual linha é mantida)
+                    return df.dropDuplicates(key_cols)
+                
+                # Usar row_number para manter última linha
+                window_spec = Window.partitionBy(*key_cols).orderBy(col(order_by_col).desc())
+                df_with_rn = df.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                self.logger.info(f"Deduplicação concluída: {df_deduplicated.count()} linhas")
+                return df_deduplicated
+            
+            # ========== Deduplicação para Agregações (by_service, aggregated, etc) ==========
+            def deduplicate_aggregation(self, df, key_cols=None):
+                """
+                Deduplicar agregações por chave natural.
+                Mantém última linha (com maior timestamp).
+                
+                Args:
+                    df: DataFrame com agregações
+                    key_cols: Colunas de chave natural (ex: ["window_start", "window_end", "tenant_id"])
+                
+                Returns:
+                    DataFrame deduplicated
+                """
+                if key_cols is None:
+                    # Inferir chave natural
+                    key_cols = [c for c in df.columns if c.startswith("window") or c in ["tenant_id", "service_id", "version"]]
+                
+                self.logger.info(f"Deduplicando agregação por chave: {key_cols}")
+                
+                # Manter última linha por chave (maior window_end)
+                window_spec = Window.partitionBy(*key_cols).orderBy(col("window_end").desc())
+                df_with_rn = df.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                self.logger.info(f"Deduplicação concluída: {df_deduplicated.count()} linhas")
+                return df_deduplicated
+            
+            # ========== Deduplicação para Billing ==========
+            def deduplicate_billing(self, df):
+                """
+                Deduplicar billing por (day, tenant_id).
+                Mantém última linha (com maior unique_event_count).
+                
+                Args:
+                    df: DataFrame com agregações de billing
+                
+                Returns:
+                    DataFrame deduplicated
+                """
+                self.logger.info("Deduplicando billing por (day, tenant_id)")
+                
+                key_cols = ["day_start", "tenant_id"]
+                window_spec = Window.partitionBy(*key_cols).orderBy(col("unique_event_count").desc())
+                df_with_rn = df.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                self.logger.info(f"Deduplicação concluída: {df_deduplicated.count()} linhas")
+                return df_deduplicated
+            
+            # ========== Deduplicação para Anomalias/SLA/Comportamento ==========
+            def deduplicate_detection(self, df, id_col):
+                """
+                Deduplicar detecções (anomalias, SLA violations, behavior changes) por ID.
+                
+                Args:
+                    df: DataFrame com detecções
+                    id_col: Coluna de ID único (ex: "anomaly_id", "violation_id", "change_id")
+                
+                Returns:
+                    DataFrame deduplicated
+                """
+                self.logger.info(f"Deduplicando detecções por {id_col}")
+                
+                df_deduplicated = df.dropDuplicates([id_col])
+                
+                self.logger.info(f"Deduplicação concluída: {df_deduplicated.count()} linhas")
+                return df_deduplicated
+            
+            # ========== Deduplicação para Eventos (Cerebro) ==========
+            def deduplicate_events(self, df):
+                """
+                Deduplicar eventos por event_id.
+                
+                Args:
+                    df: DataFrame com eventos
+                
+                Returns:
+                    DataFrame deduplicated
+                """
+                self.logger.info("Deduplicando eventos por event_id")
+                
+                df_deduplicated = df.dropDuplicates(["event_id"])
+                
+                self.logger.info(f"Deduplicação concluída: {df_deduplicated.count()} linhas")
+                return df_deduplicated
+            
+            # ========== Validação de Idempotência ==========
+            def validate_idempotency(self, df1, df2, key_cols):
+                """
+                Validar que dois DataFrames são idênticos (idempotência).
+                
+                Args:
+                    df1: Primeiro DataFrame
+                    df2: Segundo DataFrame
+                    key_cols: Colunas de chave natural
+                
+                Returns:
+                    True se idênticos, False caso contrário
+                """
+                self.logger.info(f"Validando idempotência por chave: {key_cols}")
+                
+                # Comparar contagem
+                count1 = df1.count()
+                count2 = df2.count()
+                if count1 != count2:
+                    self.logger.error(f"Contagem diferente: {count1} vs {count2}")
+                    return False
+                
+                # Comparar dados
+                diff = df1.exceptAll(df2).count()
+                if diff > 0:
+                    self.logger.error(f"Dados diferentes: {diff} linhas")
+                    return False
+                
+                self.logger.info("✅ Idempotência validada")
+                return True
+            
+            # ========== Teste de Reprocessamento ==========
+            def test_reprocessing(self, df_original, dedup_func):
+                """
+                Teste: Processar dados 2× e validar que resultado é idêntico.
+                
+                Args:
+                    df_original: DataFrame original
+                    dedup_func: Função de deduplicação
+                
+                Returns:
+                    True se teste passou, False caso contrário
+                """
+                self.logger.info("Testando reprocessamento (2× execução)")
+                
+                # Executar 1×
+                df_result_1 = dedup_func(df_original)
+                
+                # Duplicar dados (simular reprocessamento)
+                df_duplicated = df_original.union(df_original)
+                
+                # Executar 2×
+                df_result_2 = dedup_func(df_duplicated)
+                
+                # Validar
+                if df_result_1.count() != df_result_2.count():
+                    self.logger.error(f"Contagem diferente: {df_result_1.count()} vs {df_result_2.count()}")
+                    return False
+                
+                self.logger.info("✅ Teste de reprocessamento passou")
+                return True
+
+        def create_spark_session():
+            """Cria sessão Spark"""
+            return SparkSession.builder \
+                .appName("forge-write-deduplication") \
+                .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = create_spark_session()
+            dedup = WriteDeduplication(spark)
+            
+            # Exemplo: Deduplicar agregações
+            df_aggregated = spark.read.parquet("/data/forge/aggregated")
+            df_deduplicated = dedup.deduplicate_aggregation(df_aggregated)
+            
+            # Validar idempotência
+            df_aggregated_2 = spark.read.parquet("/data/forge/aggregated")
+            df_deduplicated_2 = dedup.deduplicate_aggregation(df_aggregated_2)
+            
+            dedup.validate_idempotency(df_deduplicated, df_deduplicated_2, ["window_start", "window_end", "tenant_id"])
+            
+            # Teste de reprocessamento
+            dedup.test_reprocessing(df_aggregated, lambda df: dedup.deduplicate_aggregation(df))
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar deduplicação
+        spark-submit \
+        --master local[4] \
+        forge/jobs/write_deduplication.py
+        # Esperado: deduplicação funciona, idempotência validada
+        ```
+
+        ---
+
+        ## 4. Implemente estratégia de compactação de arquivos
+
+        **Ação:** Defina política de compactação para evitar problema de arquivos pequenos.
+
+        **Onde:** Arquivo `forge/config/compaction-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Compactação — Problema de Arquivos Pequenos
+
+        ## Problema
+        Streaming escreve a cada 30 s, criando muitos arquivos pequenos (~10–50 MB cada).
+        Isso causa:
+        - **Overhead de metadados:** Cada arquivo tem overhead (inode, índice)
+        - **Lentidão de queries:** Ler 1000 arquivos pequenos é mais lento que ler 10 arquivos grandes
+        - **Custo de armazenamento:** Fragmentação aumenta custo
+        - **Custo de compactação:** Compactar muitos arquivos é caro
+
+        **Exemplo:**
+        ```
+        Sem compactação (30 s × 120 = 3600 s = 1 hora):
+        - 120 arquivos por hora
+        - Tamanho: 120 × 20 MB = 2.4 GB
+        - Overhead: 120 × 1 MB (metadados) = 120 MB
+
+        Com compactação (1 arquivo por hora):
+        - 1 arquivo por hora
+        - Tamanho: 2.4 GB
+        - Overhead: 1 × 1 MB (metadados) = 1 MB
+        ```
+
+        ## Estratégia: Compactação Incremental por Hora
+
+        ### Política
+        1. **Escrita:** Escrever a cada 30 s (sem compactação)
+        2. **Compactação:** Compactar partição 1× por hora (após fechamento)
+        3. **Frequência:** Executar compactação em janela de manutenção (02:00–04:00 UTC)
+        4. **Retenção:** Manter dados por 90 dias
+
+        ### Implementação
+
+        #### Opção 1: Usar Delta Lake (Recomendado)
+        ```python
+        # Delta Lake suporta OPTIMIZE nativamente
+        spark.sql("""
+        OPTIMIZE delta.`/data/forge/aggregated`
+        WHERE hour = '2024-01-15-10'
+        ZORDER BY (tenant_id, service_id)
+        """)
+        ```
+
+        **Vantagens:**
+        - Compactação automática
+        - ZORDER para otimizar queries
+        - Versionamento de dados
+
+        **Desvantagens:**
+        - Requer Delta Lake (custo adicional)
+
+        #### Opção 2: Usar Parquet + Rewrite (Sem Delta)
+        ```python
+        def compact_partition(spark, table_name, hour_str):
+            """Compactar partição por hora"""
+            # Ler partição
+            df = spark.read.parquet(f"/data/forge/{table_name}/hour={hour_str}")
+            
+            # Reescrever com menos partições (ex: 1 arquivo)
+            df.coalesce(1).write.mode("overwrite") \
+                .parquet(f"/data/forge/{table_name}/hour={hour_str}")
+            
+            print(f"Partição {hour_str} compactada")
+
+        # Agendar compactação 1× por hora (após fechamento)
+        # Usar Airflow/cron para executar em 02:00–04:00 UTC
+        ```
+
+        **Vantagens:**
+        - Sem dependência de Delta Lake
+        - Simples de implementar
+
+        **Desvantagens:**
+        - Rewrite é caro (relê e reescreve dados)
+        - Sem versionamento
+
+        #### Opção 3: Usar Spark Structured Streaming com Compactação Automática
+        ```python
+        # Configurar Spark para compactar automaticamente
+        spark.conf.set("spark.sql.streaming.fileStore.compactInterval", "3600")  # 1 hora
+        spark.conf.set("spark.sql.streaming.fileStore.minBatchesToRetain", "2")
+
+        # Escrever com compactação automática
+        query = df_aggregated.writeStream \
+            .format("parquet") \
+            .option("path", "/data/forge/aggregated") \
+            .option("checkpointLocation", "/data/forge/checkpoint/aggregated") \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        **Vantagens:**
+        - Automático
+        - Sem overhead manual
+
+        **Desvantagens:**
+        - Menos controle
+        - Pode compactar em horários ruins
+
+        ---
+
+        ## Cronograma de Compactação
+
+        ### Janela de Manutenção: 02:00–04:00 UTC
+
+        **Razão:** Fora do horário de pico de queries (08:00–18:00 UTC)
+
+        **Procedimento:**
+        ```python
+        # Job de compactação (executar 1× por dia em 02:00 UTC)
+        def daily_compaction_job():
+            """Compactar partições do dia anterior"""
+            from datetime import datetime, timedelta
+            
+            spark = SparkSession.builder.appName("forge-compaction").getOrCreate()
+            
+            # Compactar partições de 24 horas atrás
+            yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            tables = ["aggregated", "by_service", "by_version", "percentiles"]
+            
+            for table in tables:
+                for hour in range(24):
+                    hour_str = f"{yesterday}-{hour:02d}"
+                    try:
+                        spark.sql(f"""
+                        OPTIMIZE parquet.`/data/forge/{table}`
+                        WHERE hour = '{hour_str}'
+                        """)
+                        print(f"✅ {table}/{hour_str} compactado")
+                    except Exception as e:
+                        print(f"❌ {table}/{hour_str} falhou: {e}")
+            
+            # Compactar billing (1× por dia)
+            spark.sql(f"""
+            OPTIMIZE parquet.`/data/forge/billing_events`
+            WHERE day = '{yesterday}'
+            """)
+            print(f"✅ billing_events/{yesterday} compactado")
+
+        # Agendar com Airflow
+        # DAG: forge-daily-compaction
+        # Schedule: 02:00 UTC
+        # Timeout: 2 horas
+        ```
+
+        ---
+
+        ## Monitoramento de Compactação
+
+        ```python
+        def monitor_file_sizes(spark, table_name):
+            """Monitorar tamanho de arquivos"""
+            import os
+            
+            path = f"/data/forge/{table_name}"
+            
+            # Contar arquivos
+            files = []
+            for root, dirs, filenames in os.walk(path):
+                for filename in filenames:
+                    if filename.endswith(".parquet"):
+                        filepath = os.path.join(root, filename)
+                        size = os.path.getsize(filepath)
+                        files.append((filepath, size))
+            
+            # Estatísticas
+            total_size = sum(size for _, size in files)
+            avg_size = total_size / len(files) if files else 0
+            min_size = min(size for _, size in files) if files else 0
+            max_size = max(size for _, size in files) if files else 0
+            
+            print(f"Tabela: {table_name}")
+            print(f"  Arquivos: {len(files)}")
+            print(f"  Tamanho total: {total_size / 1e9:.2f} GB")
+            print(f"  Tamanho médio: {avg_size / 1e6:.2f} MB")
+            print(f"  Tamanho mín: {min_size / 1e6:.2f} MB")
+            print(f"  Tamanho máx: {max_size / 1e6:.2f} MB")
+            
+            # Alertar se muitos arquivos pequenos
+            small_files = [f for _, s in files if s < 10e6]  # < 10 MB
+            if len(small_files) > 100:
+                print(f"⚠️  {len(small_files)} arquivos pequenos (< 10 MB)")
+
+        # Executar monitoramento
+        spark = SparkSession.builder.appName("forge-monitor").getOrCreate()
+        for table in ["aggregated", "by_service", "by_version", "percentiles"]:
+            monitor_file_sizes(spark, table)
+        ```
+
+        ---
+
+        ## Impacto de Compactação
+
+        ### Custo de Armazenamento
+        ```
+        Sem compactação:
+        - 120 arquivos/hora × 24 horas = 2880 arquivos/dia
+        - Overhead: 2880 × 1 MB = 2.88 GB/dia
+        - Custo: 2.88 GB × $0.023/GB/mês = $0.07/dia
+
+        Com compactação:
+        - 24 arquivos/dia (1 por hora)
+        - Overhead: 24 × 1 MB = 24 MB/dia
+        - Custo: 24 MB × $0.023/GB/mês = $0.0006/dia
+
+        Economia: $0.07 - $0.0006 = $0.069/dia = $25/ano
+        ```
+
+        ### Custo de Compactação
+        ```
+        Rewrite de 1 hora de dados:
+        - Tamanho: 2.4 GB
+        - Tempo: ~5 min (em cluster de 4 nós)
+        - Custo: 4 nós × 5 min × $0.50/hora = $0.017
+
+        Compactação diária (24 horas):
+        - Custo: 24 × $0.017 = $0.41/dia = $150/ano
+
+        ROI: Economia ($25/ano) < Custo ($150/ano)
+        Conclusão: Compactação não é viável para todas as partições
+        ```
+
+        ### Recomendação
+        - **Compactar:** Apenas partições > 7 dias (dados "frios")
+        - **Não compactar:** Partições < 7 dias (dados "quentes", ainda sendo atualizadas)
+
+        ```python
+        def smart_compaction(spark):
+            """Compactar apenas partições antigas"""
+            from datetime import datetime, timedelta
+            
+            # Compactar partições > 7 dias
+            cutoff_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+            
+            spark.sql(f"""
+            OPTIMIZE parquet.`/data/forge/aggregated`
+            WHERE hour < '{cutoff_date}'
+            """)
+        ```
+
+        ---
+
+        ## Validação
+
+        - [ ] Compactação reduz número de arquivos
+        - [ ] Queries em dados compactados são mais rápidas
+        - [ ] Custo de compactação é menor que economia de armazenamento
+        - [ ] Dados compactados são idênticos aos originais
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Monitorar tamanho de arquivos antes e depois
+        spark-submit \
+        --master local[4] \
+        forge/jobs/monitor_compaction.py
+        # Esperado: tamanho médio de arquivo aumenta após compactação
+        ```
+
+        ---
+
+        ## 5. Implemente isolamento e leitura consistente
+
+        **Ação:** Defina como consumidores leem dados durante escrita sem inconsistências.
+
+        **Onde:** Arquivo `forge/config/read-consistency-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Isolamento e Leitura Consistente
+
+        ## Problema
+        Enquanto streaming escreve dados (modo `update`), consumidores leem dados.
+        Isso pode causar:
+        - **Leitura suja:** Ler dados parciais de uma janela ainda aberta
+        - **Leitura fantasma:** Ler dados que foram atualizados retroativamente
+        - **Inconsistência:** Agregações não batem com eventos
+
+        **Exemplo:**
+        ```
+        Tempo 10:00–10:30 (janela 1)
+        - 10:15: Streaming escreve (window_1, tenant_1, total=100, count=10)
+        - 10:20: Sentinel lê (window_1, tenant_1, total=100, count=10) ← Leitura suja!
+        - 10:25: Evento atrasado chega, streaming atualiza (window_1, tenant_1, total=110, count=11)
+        - 10:30: Sentinel lê novamente (window_1, tenant_1, total=110, count=11) ← Inconsistência!
+        ```
+
+        ## Estratégia: Leitura de Partições Fechadas
+
+        ### Definição
+        Consumidores devem ler apenas partições **fechadas** (marcadas com `_CLOSED`).
+
+        ### Implementação
+
+        #### Opção 1: Usar Marcador de Fechamento
+        ```python
+        def read_closed_partitions(spark, table_name):
+            """Ler apenas partições fechadas"""
+            # Ler tabela de metadados
+            df_metadata = spark.read.parquet("/data/forge/partition_metadata")
+            closed_hours = df_metadata.filter(col("status") == "closed").select("hour").collect()
+            closed_hours_list = [row["hour"] for row in closed_hours]
+            
+            # Ler apenas partições fechadas
+            df = spark.read.parquet(f"/data/forge/{table_name}")
+            df_filtered = df.filter(col("hour").isin(closed_hours_list))
+            
+            return df_filtered
+
+        # Usar em Sentinel
+        df_aggregated = read_closed_partitions(spark, "aggregated")
+        df_aggregated.show()
+        ```
+
+        #### Opção 2: Usar Timestamp de Fechamento
+        ```python
+        def read_closed_partitions_by_time(spark, table_name, lag_minutes=5):
+            """Ler partições que foram fechadas há pelo menos lag_minutes"""
+            from datetime import datetime, timedelta
+            
+            # Calcular hora de corte (5 min atrás)
+            cutoff_time = datetime.utcnow() - timedelta(minutes=lag_minutes)
+            
+            # Ler apenas partições anteriores ao corte
+            df = spark.read.parquet(f"/data/forge/{table_name}")
+            df_filtered = df.filter(col("window_end") < cutoff_time)
+            
+            return df_filtered
+
+        # Usar em Sentinel
+        df_aggregated = read_closed_partitions_by_time(spark, "aggregated", lag_minutes=5)
+        df_aggregated.show()
+        ```
+
+        #### Opção 3: Usar Delta Lake (Recomendado)
+        ```python
+        # Delta Lake suporta time travel e snapshot isolation
+        df = spark.read.format("delta") \
+            .option("versionAsOf", 0) \
+            .load("/data/forge/aggregated")
+
+        # Ou usar timestamp
+        df = spark.read.format("delta") \
+            .option("timestampAsOf", "2024-01-15 10:00:00") \
+            .load("/data/forge/aggregated")
+        ```
+
+        ---
+
+        ## Recomendações por Consumidor
+
+        ### Sentinel (Dashboards)
+        **Requisito:** Dados finais (partições fechadas)
+
+        **Query:**
+        ```sql
+        SELECT tenant_id, service_id, SUM(total_value) as total
+        FROM aggregated
+        WHERE hour < date_trunc('hour', current_timestamp() - interval 5 minutes)
+        GROUP BY tenant_id, service_id
+        ```
+
+        **Justificativa:** Usar dados de 5 min atrás garante que partição está fechada
+
+        ### Cerebro (Indexação)
+        **Requisito:** Dados quase em tempo real (pode ter duplicatas)
+
+        **Implementação:**
+        ```python
+        # Ler todos os eventos (incluindo partições abertas)
+        df_events = spark.read.parquet("/data/forge/enriched")
+
+        # Deduplicar por event_id (Cerebro faz isso)
+        df_events_dedup = df_events.dropDuplicates(["event_id"])
+
+        # Enviar para Elasticsearch
+        df_events_dedup.write.format("es") \
+            .option("es.nodes", "<elasticsearch-nodes>") \
+            .option("es.resource", "forge-events") \
+            .mode("append") \
+            .save()
+        ```
+
+        ### Pepper (Billing)
+        **Requisito:** Dados finais (partições fechadas)
+
+        **Query:**
+        ```sql
+        SELECT tenant_id, SUM(unique_event_count) as total_events
+        FROM billing_events
+        WHERE day < current_date()  -- Apenas dias completos
+        GROUP BY tenant_id
+        ```
+
+        **Justificativa:** Usar dados de dias anteriores garante que partição está fechada
+
+        ---
+
+        ## Validação de Consistência
+
+        ```python
+        def validate_read_consistency(spark):
+            """Validar que leituras são consistentes"""
+            # Ler dados 2× com 1 min de intervalo
+            df_read_1 = read_closed_partitions(spark, "aggregated")
+            count_1 = df_read_1.count()
+            
+            time.sleep(60)
+            
+            df_read_2 = read_closed_partitions(spark, "aggregated")
+            count_2 = df_read_2.count()
+            
+            # Validar
+            if count_1 == count_2:
+                print("✅ Leituras são consistentes")
+            else:
+                print(f"❌ Leituras inconsistentes: {count_1} vs {count_2}")
+        ```
+
+        ---
+
+        ## Impacto em Latência
+
+        ```
+        Sem lag (ler dados abertos):
+        - Latência: 30 s (dados chegam em tempo real)
+        - Risco: Leitura suja, inconsistência
+
+        Com lag de 5 min (ler dados fechados):
+        - Latência: 5 min (dados chegam com 5 min de atraso)
+        - Risco: Nenhum (dados são finais)
+
+        Recomendação: Usar lag de 5 min para dados críticos (billing, SLA)
+                    Usar lag de 0 min para dados não-críticos (dashboards)
+        ```
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Validar que leituras são consistentes
+        spark-submit \
+        --master local[4] \
+        forge/jobs/validate_consistency.py
+        # Esperado: leituras são consistentes
+        ```
+
+        ---
+
+        ## 6. Estime impacto em custo de armazenamento e consulta
+
+        **Ação:** Calcule custo de streaming vs batch.
+
+        **Onde:** Arquivo `forge/docs/cost-analysis.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Análise de Custo — Streaming vs Batch
+
+        ## Suposições [SUPOSIÇÃO]
+        - Volume de eventos: 1 bilhão/dia (11.6k eventos/s)
+        - Tamanho médio de evento: 500 bytes
+        - Retenção de dados: 90 dias
+        - Custo de armazenamento: $0.023/GB/mês (S3 Standard)
+        - Custo de compute: $0.50/hora por nó Spark
+        - Cluster Spark: 4 nós (1 master + 3 workers)
+
+        ## Cálculo de Armazenamento
+
+        ### Batch (60 min)
+        ```
+        Volume/dia: 1B eventos × 500 bytes = 500 GB/dia
+        Retenção: 90 dias × 500 GB = 45 TB
+        Custo/mês: 45 TB × $0.023/GB = 45,000 GB × $0.023 = $1,035/mês
+        ```
+
+        ### Streaming (30 s)
+        ```
+        Volume/dia: 1B eventos × 500 bytes = 500 GB/dia
+        Retenção: 90 dias × 500 GB = 45 TB
+        Custo/mês: 45 TB × $0.023/GB = 45,000 GB × $0.023 = $1,035/mês
+
+        Diferença: 0% (mesmo volume de dados)
+        ```
+
+        **Conclusão:** Armazenamento é idêntico
+
+        ---
+
+        ## Cálculo de Compute
+
+        ### Batch (60 min)
+        ```
+        Frequência: 1 lote/hora × 24 horas = 24 lotes/dia
+        Duração/lote: 40 min (transformação) + 10 min (escrita) = 50 min
+        Tempo total/dia: 24 × 50 min = 1200 min = 20 horas
+        Custo/dia: 4 nós × 20 horas × $0.50/hora = $40/dia
+        Custo/mês: $40 × 30 = $1,200/mês
+        ```
+
+        ### Streaming (30 s)
+        ```
+        Frequência: Contínua (24/7)
+        Duração: 24 horas/dia
+        Custo/dia: 4 nós × 24 horas × $0.50/hora = $48/dia
+        Custo/mês: $48 × 30 = $1,440/mês
+
+        Diferença: $1,440 - $1,200 = $240/mês (20% mais caro)
+        ```
+
+        **Conclusão:** Streaming é 20% mais caro em compute
+
+        ---
+
+        ## Cálculo de Compactação
+
+        ### Batch (60 min)
+        ```
+        Compactação: Não necessária (1 arquivo por hora)
+        Custo: $0/mês
+        ```
+
+        ### Streaming (30 s)
+        ```
+        Arquivos/hora: 120 (1 a cada 30 s)
+        Compactação: 1× por dia (24 partições)
+        Tempo/compactação: 24 × 5 min = 120 min = 2 horas
+        Custo/dia: 4 nós × 2 horas × $0.50/hora = $4/dia
+        Custo/mês: $4 × 30 = $120/mês
+
+        Diferença: $120/mês
+        ```
+
+        **Conclusão:** Compactação custa $120/mês
+
+        ---
+
+        ## Cálculo de Queries
+
+        ### Batch (60 min)
+        ```
+        Queries/dia: 1000 (estimado)
+        Tamanho/query: 10 GB (scan de 1 dia)
+        Tempo/query: 30 s (com 4 nós)
+        Custo/query: 4 nós × 30 s / 3600 s × $0.50/hora = $0.017
+        Custo/dia: 1000 × $0.017 = $17/dia
+        Custo/mês: $17 × 30 = $510/mês
+        ```
+
+        ### Streaming (30 s)
+        ```
+        Queries/dia: 1000 (estimado)
+        Tamanho/query: 10 GB (scan de 1 dia)
+        Tempo/query: 30 s (com 4 nós)
+        Custo/query: 4 nós × 30 s / 3600 s × $0.50/hora = $0.017
+        Custo/dia: 1000 × $0.017 = $17/dia
+        Custo/mês: $17 × 30 = $510/mês
+
+        Diferença: 0% (mesmo tempo de query)
+        ```
+
+        **Conclusão:** Queries têm mesmo custo
+
+        ---
+
+        ## Custo Total
+
+        | Componente | Batch | Streaming | Diferença |
+        |-----------|-------|-----------|-----------|
+        | Armazenamento | $1,035 | $1,035 | $0 |
+        | Compute | $1,200 | $1,440 | +$240 |
+        | Compactação | $0 | $120 | +$120 |
+        | Queries | $510 | $510 | $0 |
+        | **Total** | **$2,745** | **$3,105** | **+$360 (13%)** |
+
+        ---
+
+        ## Benefícios Não-Monetários
+
+        ### Latência
+        - Batch: 60 min (dados chegam a cada hora)
+        - Streaming: 2 min p95 (dados chegam em tempo real)
+        - **Benefício:** Alertas mais rápidos, dashboards em tempo real
+
+        ### Confiabilidade
+        - Batch: Se um lote falha, o próximo processa 2× volume (risco de falha em cascata)
+        - Streaming: Se um bloco falha, o próximo processa volume normal (mais resiliente)
+        - **Benefício:** Menos falhas, menos reprocessamento
+
+        ### Flexibilidade
+        - Batch: Difícil adicionar novas transformações (requer reprocessamento de histórico)
+        - Streaming: Fácil adicionar novas transformações (processa dados novos)
+        - **Benefício:** Mais ágil para mudanças
+
+        ---
+
+        ## ROI (Return on Investment)
+
+        ```
+        Custo adicional/ano: $360 × 12 = $4,320
+        Benefícios:
+        - Redução de alertas tardios: ~$10k/ano (menos downtime)
+        - Redução de falhas em cascata: ~$5k/ano (menos reprocessamento)
+        - Agilidade para mudanças: ~$3k/ano (menos tempo de desenvolvimento)
+        Total de benefícios: ~$18k/ano
+
+        ROI: ($18k - $4.32k) / $4.32k = 316% (muito positivo)
+        ```
+
+        ---
+
+        ## Recomendação
+
+        **Migrar para streaming é viável:**
+        - Custo adicional é pequeno (13%)
+        - Benefícios são grandes (latência, confiabilidade, flexibilidade)
+        - ROI é positivo (316%)
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que análise de custo está documentada
+        grep -E "Custo|Benefício|ROI" forge/docs/cost-analysis.md | wc -l
+        # Esperado: > 20 linhas
+        ```
+
+        ---
+
+        ## 7. Crie código de escrita incremental com deduplicação
+
+        **Ação:** Implemente escrita em Parquet com deduplicação e merge.
+
+        **Onde:** Arquivo `forge/jobs/streaming_write.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Escrita Incremental com Deduplicação
+        Implementa estratégia de escrita para streaming.
+        """
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, row_number, max as spark_max, current_timestamp
+        )
+        from pyspark.sql.window import Window
+        import logging
+        from datetime import datetime
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        class StreamingWrite:
+            """Estratégias de escrita para streaming"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            # ========== Escrita com Upsert/Merge ==========
+            def write_aggregation_with_merge(self, df, batch_id, table_name, key_cols):
+                """
+                Escrever agregações com merge (deduplicação por chave natural).
+                
+                Args:
+                    df: DataFrame com agregações
+                    batch_id: ID do batch
+                    table_name: Nome da tabela (ex: "aggregated")
+                    key_cols: Colunas de chave natural
+                """
+                self.logger.info(f"Batch {batch_id}: Escrevendo {table_name} com merge")
+                
+                # Deduplicar por chave natural (manter última linha)
+                window_spec = Window.partitionBy(*key_cols).orderBy(col("window_end").desc())
+                df_with_rn = df.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                # Escrever com overwrite (simula merge)
+                df_deduplicated.write.mode("overwrite") \
+                    .option("mergeSchema", "true") \
+                    .parquet(f"/data/forge/{table_name}")
+                
+                self.logger.info(f"Batch {batch_id}: {df_deduplicated.count()} linhas escritas")
+            
+            # ========== Escrita com Staging + Merge ==========
+            def write_billing_with_staging(self, df, batch_id):
+                """
+                Escrever billing com staging + merge.
+                
+                Args:
+                    df: DataFrame com agregações de billing
+                    batch_id: ID do batch
+                """
+                self.logger.info(f"Batch {batch_id}: Escrevendo billing com staging")
+                
+                # Deduplicar por (day, tenant_id)
+                window_spec = Window.partitionBy("day_start", "tenant_id").orderBy(col("unique_event_count").desc())
+                df_with_rn = df.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                # Escrever em staging
+                df_deduplicated.write.mode("append") \
+                    .parquet("/data/forge/billing_events_staging")
+                
+                self.logger.info(f"Batch {batch_id}: {df_deduplicated.count()} linhas escritas em staging")
+            
+            def merge_billing_staging_to_main(self):
+                """
+                Merge diário de staging para principal (executar 1× por dia em 02:00 UTC).
+                """
+                self.logger.info("Executando merge diário de billing")
+                
+                # Ler staging
+                df_staging = self.spark.read.parquet("/data/forge/billing_events_staging")
+                
+                # Ler principal
+                try:
+                    df_main = self.spark.read.parquet("/data/forge/billing_events")
+                except:
+                    # Se principal não existe, criar
+                    df_main = self.spark.createDataFrame([], df_staging.schema)
+                
+                # Merge: atualizar ou inserir
+                df_merged = df_main.union(df_staging)
+                
+                # Deduplicar (manter última linha por chave)
+                window_spec = Window.partitionBy("day_start", "tenant_id").orderBy(col("unique_event_count").desc())
+                df_with_rn = df_merged.withColumn("rn", row_number().over(window_spec))
+                df_final = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                # Escrever principal
+                df_final.write.mode("overwrite") \
+                    .parquet("/data/forge/billing_events")
+                
+                # Limpar staging
+                self.spark.sql("DELETE FROM parquet.`/data/forge/billing_events_staging`")
+                
+                self.logger.info(f"Merge concluído: {df_final.count()} linhas em principal")
+            
+            # ========== Escrita com Append + Deduplicação ==========
+            def write_detection_with_dedup(self, df, batch_id, table_name, id_col):
+                """
+                Escrever detecções (anomalias, SLA, comportamento) com append + dedup.
+                
+                Args:
+                    df: DataFrame com detecções
+                    batch_id: ID do batch
+                    table_name: Nome da tabela
+                    id_col: Coluna de ID único
+                """
+                self.logger.info(f"Batch {batch_id}: Escrevendo {table_name} com append + dedup")
+                
+                # Deduplicar por ID
+                df_deduplicated = df.dropDuplicates([id_col])
+                
+                # Append
+                df_deduplicated.write.mode("append") \
+                    .parquet(f"/data/forge/{table_name}")
+                
+                self.logger.info(f"Batch {batch_id}: {df_deduplicated.count()} linhas escritas")
+            
+            # ========== Escrita para Kafka (Cerebro) ==========
+            def write_cerebro_with_dedup(self, df, batch_id):
+                """
+                Escrever para Cerebro com deduplicação.
+                
+                Args:
+                    df: DataFrame com eventos
+                    batch_id: ID do batch
+                """
+                self.logger.info(f"Batch {batch_id}: Escrevendo para Cerebro com dedup")
+                
+                # Deduplicar por event_id
+                df_deduplicated = df.dropDuplicates(["event_id"])
+                
+                # Escrever para Kafka
+                df_deduplicated.write.format("kafka") \
+                    .option("kafka.bootstrap.servers", "<relay-broker>") \
+                    .option("topic", "forge-events-indexed") \
+                    .mode("append") \
+                    .save()
+                
+                self.logger.info(f"Batch {batch_id}: {df_deduplicated.count()} eventos enviados para Cerebro")
+            
+            # ========== Fechar Partição ==========
+            def close_partition_if_ready(self, df, batch_id, hour_col="window_start"):
+                """
+                Fechar partição se watermark passou.
+                
+                Args:
+                    df: DataFrame
+                    batch_id: ID do batch
+                    hour_col: Coluna de hora
+                """
+                from datetime import datetime, timedelta
+                import os
+                
+                # Obter hora mínima no batch
+                min_hour = df.agg({hour_col: "min"}).collect()[0][0]
+                
+                if min_hour is None:
+                    return
+                
+                # Calcular tempo de fechamento
+                hour_end = min_hour + timedelta(hours=1)
+                watermark_time = hour_end + timedelta(seconds=45)
+                close_time = watermark_time + timedelta(seconds=60)
+                
+                # Verificar se agora > close_time
+                now = datetime.utcnow()
+                if now > close_time:
+                    # Criar marcador de fechamento
+                    hour_str = min_hour.strftime("%Y-%m-%d-%H")
+                    marker_path = f"/data/forge/partition_metadata"
+                    
+                    # Escrever em tabela de metadados
+                    self.spark.sql(f"""
+                    INSERT INTO parquet.`{marker_path}`
+                    VALUES ('{hour_str}', 'closed', current_timestamp())
+                    """)
+                    
+                    self.logger.info(f"Partição {hour_str} fechada")
+
+        def create_spark_session():
+            """Cria sessão Spark"""
+            return SparkSession.builder \
+                .appName("forge-streaming-write") \
+                .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = create_spark_session()
+            writer = StreamingWrite(spark)
+            
+            # Exemplo: Escrever agregações
+            df_aggregated = spark.read.parquet("/data/forge/aggregated_staging")
+            writer.write_aggregation_with_merge(df_aggregated, 1, "aggregated", ["window_start", "window_end", "tenant_id"])
+            
+            # Exemplo: Escrever billing
+            df_billing = spark.read.parquet("/data/forge/billing_events_staging")
+            writer.write_billing_with_staging(df_billing, 1)
+            
+            # Exemplo: Merge diário de billing
+            writer.merge_billing_staging_to_main()
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar escrita
+        spark-submit \
+        --master local[4] \
+        forge/jobs/streaming_write.py
+        # Esperado: dados são escritos com deduplicação
+        ```
+
+        ---
+
+        ## 8. Crie job de compactação agendado
+
+        **Ação:** Implemente job de compactação para executar 1× por dia.
+
+        **Onde:** Arquivo `forge/jobs/daily_compaction.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Job de Compactação Diária
+        Compacta partições antigas para reduzir número de arquivos.
+        Executar 1× por dia em 02:00 UTC.
+        """
+        from pyspark.sql import SparkSession
+        import logging
+        from datetime import datetime, timedelta
+        import os
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        class DailyCompaction:
+            """Compactação diária de partições"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            def compact_partition(self, table_name, hour_str):
+                """
+                Compactar uma partição por hora.
+                
+                Args:
+                    table_name: Nome da tabela
+                    hour_str: String de hora (ex: "2024-01-15-10")
+                """
+                try:
+                    self.logger.info(f"Compactando {table_name}/{hour_str}")
+                    
+                    # Ler partição
+                    path = f"/data/forge/{table_name}/hour={hour_str}"
+                    df = self.spark.read.parquet(path)
+                    
+                    # Reescrever com 1 arquivo
+                    df.coalesce(1).write.mode("overwrite") \
+                        .parquet(path)
+                    
+                    self.logger.info(f"✅ {table_name}/{hour_str} compactado")
+                    return True
+                except Exception as e:
+                    self.logger.error(f"❌ {table_name}/{hour_str} falhou: {e}")
+                    return False
+            
+            def compact_day(self, table_name, day_str):
+                """
+                Compactar todas as partições de um dia.
+                
+                Args:
+                    table_name: Nome da tabela
+                    day_str: String de dia (ex: "2024-01-15")
+                """
+                self.logger.info(f"Compactando {table_name} para {day_str}")
+                
+                success_count = 0
+                for hour in range(24):
+                    hour_str = f"{day_str}-{hour:02d}"
+                    if self.compact_partition(table_name, hour_str):
+                        success_count += 1
+                
+                self.logger.info(f"{table_name}: {success_count}/24 partições compactadas")
+                return success_count
+            
+            def compact_all_tables(self, days_back=7):
+                """
+                Compactar todas as tabelas para os últimos N dias.
+                
+                Args:
+                    days_back: Número de dias para compactar (padrão: 7)
+                """
+                self.logger.info(f"Compactando todas as tabelas (últimos {days_back} dias)")
+                
+                tables = ["aggregated", "by_service", "by_version", "percentiles"]
+                
+                for day_offset in range(1, days_back + 1):
+                    day = (datetime.utcnow() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+                    
+                    for table in tables:
+                        self.compact_day(table, day)
+                
+                # Compactar billing (1 arquivo por dia)
+                self.logger.info("Compactando billing_events")
+                for day_offset in range(1, days_back + 1):
+                    day = (datetime.utcnow() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+                    try:
+                        path = f"/data/forge/billing_events/day={day}"
+                        df = self.spark.read.parquet(path)
+                        df.coalesce(1).write.mode("overwrite").parquet(path)
+                        self.logger.info(f"✅ billing_events/{day} compactado")
+                    except Exception as e:
+                        self.logger.error(f"❌ billing_events/{day} falhou: {e}")
+            
+            def monitor_file_sizes(self, table_name):
+                """
+                Monitorar tamanho de arquivos.
+                
+                Args:
+                    table_name: Nome da tabela
+                """
+                self.logger.info(f"Monitorando tamanho de arquivos em {table_name}")
+                
+                path = f"/data/forge/{table_name}"
+                
+                # Contar arquivos
+                files = []
+                for root, dirs, filenames in os.walk(path):
+                    for filename in filenames:
+                        if filename.endswith(".parquet"):
+                            filepath = os.path.join(root, filename)
+                            try:
+                                size = os.path.getsize(filepath)
+                                files.append((filepath, size))
+                            except:
+                                pass
+                
+                if not files:
+                    self.logger.warning(f"Nenhum arquivo encontrado em {table_name}")
+                    return
+                
+                # Estatísticas
+                total_size = sum(size for _, size in files)
+                avg_size = total_size / len(files)
+                min_size = min(size for _, size in files)
+                max_size = max(size for _, size in files)
+                
+                self.logger.info(f"Tabela: {table_name}")
+                self.logger.info(f"  Arquivos: {len(files)}")
+                self.logger.info(f"  Tamanho total: {total_size / 1e9:.2f} GB")
+                self.logger.info(f"  Tamanho médio: {avg_size / 1e6:.2f} MB")
+                self.logger.info(f"  Tamanho mín: {min_size / 1e6:.2f} MB")
+                self.logger.info(f"  Tamanho máx: {max_size / 1e6:.2f} MB")
+                
+                # Alertar se muitos arquivos pequenos
+                small_files = [f for _, s in files if s < 10e6]  # < 10 MB
+                if len(small_files) > 100:
+                    self.logger.warning(f"⚠️  {len(small_files)} arquivos pequenos (< 10 MB)")
+
+        def create_spark_session():
+            """Cria sessão Spark"""
+            return SparkSession.builder \
+                .appName("forge-daily-compaction") \
+                .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = create_spark_session()
+            compactor = DailyCompaction(spark)
+            
+            # Compactar últimos 7 dias
+            compactor.compact_all_tables(days_back=7)
+            
+            # Monitorar tamanho de arquivos
+            for table in ["aggregated", "by_service", "by_version", "percentiles", "billing_events"]:
+                compactor.monitor_file_sizes(table)
+            
+            logger.info("Compactação concluída")
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar compactação
+        spark-submit \
+        --master local[4] \
+        forge/jobs/daily_compaction.py
+        # Esperado: partições são compactadas, tamanho de arquivo aumenta
+        ```
+
+        ---
+
+        ## 9. Crie testes de escrita e leitura consistente
+
+        **Ação:** Implemente testes para validar escrita incremental e leitura consistente.
+
+        **Onde:** Arquivo `forge/tests/test_write_consistency.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Testes de Escrita e Leitura Consistente
+        Valida que escrita incremental não cria duplicatas e leitura é consistente.
+        """
+        import pytest
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import col, count, sum as spark_sum
+        from datetime import datetime, timedelta
+        import time
+        import logging
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        @pytest.fixture(scope="session")
+        def spark():
+            """Cria sessão Spark para testes"""
+            return SparkSession.builder \
+                .appName("forge-write-consistency-tests") \
+                .master("local[4]") \
+                .getOrCreate()
+
+        class TestWriteConsistency:
+            """Testes de escrita e leitura consistente"""
+            
+            def test_no_duplicates_after_write(self, spark):
+                """Teste: Escrita não cria duplicatas"""
+                logger.info("Teste: No Duplicates After Write")
+                
+                # Dados de entrada
+                input_data = [
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "total_value": 100},
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "total_value": 110},  # Duplicata
+                    {"window_start": "2024-01-15-10", "tenant_id": "t2", "total_value": 200},
+                ]
+                df_input = spark.createDataFrame(input_data)
+                
+                # Deduplicar (simular escrita com merge)
+                df_deduplicated = df_input.dropDuplicates(["window_start", "tenant_id"])
+                
+                # Validar
+                assert df_deduplicated.count() == 2, "Deve remover duplicatas"
+                logger.info("✅ Teste passou")
+            
+            def test_idempotent_write(self, spark):
+                """Teste: Escrita é idempotente (2× escrita = 1× escrita)"""
+                logger.info("Teste: Idempotent Write")
+                
+                # Dados de entrada
+                input_data = [
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "total_value": 100},
+                    {"window_start": "2024-01-15-10", "tenant_id": "t2", "total_value": 200},
+                ]
+                df_input = spark.createDataFrame(input_data)
+                
+                # Escrever 1×
+                df_result_1 = df_input.dropDuplicates(["window_start", "tenant_id"])
+                count_1 = df_result_1.count()
+                
+                # Duplicar dados (simular reprocessamento)
+                df_duplicated = df_input.union(df_input)
+                
+                # Escrever 2×
+                df_result_2 = df_duplicated.dropDuplicates(["window_start", "tenant_id"])
+                count_2 = df_result_2.count()
+                
+                # Validar
+                assert count_1 == count_2, f"Contagem diferente: {count_1} vs {count_2}"
+                logger.info("✅ Teste passou")
+            
+            def test_read_consistency_closed_partition(self, spark):
+                """Teste: Leitura de partição fechada é consistente"""
+                logger.info("Teste: Read Consistency Closed Partition")
+                
+                # Dados de entrada (partição fechada)
+                input_data = [
+                    {"hour": "2024-01-15-10", "tenant_id": "t1", "total_value": 100},
+                    {"hour": "2024-01-15-10", "tenant_id": "t2", "total_value": 200},
+                ]
+                df_input = spark.createDataFrame(input_data)
+                
+                # Ler 1×
+                df_read_1 = df_input.filter(col("hour") < "2024-01-15-11")
+                count_1 = df_read_1.count()
+                
+                # Ler 2× (sem mudanças)
+                df_read_2 = df_input.filter(col("hour") < "2024-01-15-11")
+                count_2 = df_read_2.count()
+                
+                # Validar
+                assert count_1 == count_2, f"Contagem diferente: {count_1} vs {count_2}"
+                logger.info("✅ Teste passou")
+            
+            def test_aggregation_correctness(self, spark):
+                """Teste: Agregação está correta após escrita"""
+                logger.info("Teste: Aggregation Correctness")
+                
+                # Dados de entrada
+                input_data = [
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "metric_value": 10},
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "metric_value": 20},
+                    {"window_start": "2024-01-15-10", "tenant_id": "t1", "metric_value": 30},
+                ]
+                df_input = spark.createDataFrame(input_data)
+                
+                # Agregar
+                df_agg = df_input.groupBy("window_start", "tenant_id").agg(
+                    spark_sum("metric_value").alias("total_value"),
+                    count("*").alias("event_count")
+                )
+                
+                # Validar
+                result = df_agg.collect()[0]
+                assert result["total_value"] == 60, "SUM deve ser 60"
+                assert result["event_count"] == 3, "COUNT deve ser 3"
+                logger.info("✅ Teste passou")
+            
+            def test_billing_deduplication(self, spark):
+                """Teste: Billing é deduplicated corretamente"""
+                logger.info("Teste: Billing Deduplication")
+                
+                # Dados de entrada (com duplicatas)
+                input_data = [
+                    {"day": "2024-01-15", "tenant_id": "t1", "unique_event_count": 100},
+                    {"day": "2024-01-15", "tenant_id": "t1", "unique_event_count": 110},  # Duplicata (mais recente)
+                    {"day": "2024-01-15", "tenant_id": "t2", "unique_event_count": 200},
+                ]
+                df_input = spark.createDataFrame(input_data)
+                
+                # Deduplicar (manter última linha)
+                from pyspark.sql.window import Window
+                from pyspark.sql.functions import row_number
+                
+                window_spec = Window.partitionBy("day", "tenant_id").orderBy(col("unique_event_count").desc())
+                df_with_rn = df_input.withColumn("rn", row_number().over(window_spec))
+                df_deduplicated = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                # Validar
+                assert df_deduplicated.count() == 2, "Deve ter 2 linhas"
+                t1_row = df_deduplicated.filter(col("tenant_id") == "t1").collect()[0]
+                assert t1_row["unique_event_count"] == 110, "Deve manter última linha (110)"
+                logger.info("✅ Teste passou")
+            
+            def test_partition_closure(self, spark):
+                """Teste: Partição é fechada corretamente"""
+                logger.info("Teste: Partition Closure")
+                
+                # Simular fechamento de partição
+                from datetime import datetime, timedelta
+                
+                hour_start = datetime(2024, 1, 15, 10, 0, 0)
+                hour_end = hour_start + timedelta(hours=1)
+                watermark_time = hour_end + timedelta(seconds=45)
+                close_time = watermark_time + timedelta(seconds=60)
+                
+                # Verificar se agora > close_time
+                now = datetime.utcnow()
+                
+                # Simular: agora é 1 hora depois
+                simulated_now = hour_start + timedelta(hours=2)
+                
+                # Validar
+                assert simulated_now > close_time, "Partição deve estar fechada"
+                logger.info("✅ Teste passou")
+
+        if __name__ == "__main__":
+            pytest.main([__file__, "-v"])
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Executar testes
+        pytest forge/tests/test_write_consistency.py -v
+        # Esperado: todos os testes passam
+        ```
+
+        ---
+
+        ## X. Ponto de não-retorno
+
+        **Ponto de não-retorno:** Após o passo 7 (deploy do código de escrita em staging), o Forge começa a escrever dados em streaming.
+
+        **Por quê:** Uma vez que o job de streaming está escrevendo no DW, voltar atrás requer:
+        1. Parar o job de streaming
+        2. Limpar dados parciais do DW
+        3. Reexecutar batch para recuperar dados
+        4. Validar equivalência novamente
+
+        **Mitigação:** Antes do passo 7, executar testes completos em staging (passos 6–9).
+
+        ---
+
+        ## Y. Rollback
+
+        **Procedimento de rollback (se necessário após passo 7):**
+
+        ```bash
+        #!/bin/bash
+        # Script de rollback: voltar para batch
+        set -e
+        echo "=== Rollback: Forge Streaming → Batch ==="
+
+        # 1. Parar job de streaming
+        echo "1. Parando job de streaming..."
+        kubectl delete deployment forge-streaming-transform -n forge
+        kubectl delete deployment forge-streaming-write -n forge
+
+        # 2. Limpar dados parciais do DW
+        echo "2. Limpando dados parciais do DW..."
+        # Remover dados de streaming (últimas 24 horas)
+        # [SUPOSIÇÃO] usar SQL para remover dados
+        # DELETE FROM forge_events_aggregated WHERE ingestion_time > now() - interval 24 hours
+
+        # 3. Ativar job de batch
+        echo "3. Ativando job de batch..."
+        # [SUPOSIÇÃO] job de batch é ativado via Airflow/cron
+        airflow dags trigger forge-batch-transform
+
+        # 4. Validar que batch está processando
+        echo "4. Validando que batch está processando..."
+        sleep 60
+        airflow dags list | grep forge-batch-transform
+
+        echo "=== Rollback concluído ==="
+        ```
+
+        ---
+
+        ## Z. Critérios de conclusão
+
+        - [ ] **Estratégia de escrita:** Definida para cada tabela (upsert, staging+merge, append+dedup)
+        - [ ] **Particionamento:** Política de particionamento por hora com marcador de fechamento documentada
+        - [ ] **Deduplicação:** Código de deduplicação implementado e testado
+        - [ ] **Compactação:** Estratégia de compactação definida e job implementado
+        - [ ] **Isolamento:** Estratégia de leitura consistente documentada
+        - [ ] **Custo:** Análise de custo (streaming vs batch) documentada
+        - [ ] **Código de escrita:** Implementado para todas as tabelas (`streaming_write.py`)
+        - [ ] **Job de compactação:** Implementado (`daily_compaction.py`)
+        - [ ] **Testes:** Testes de escrita e leitura consistente implementados (`test_write_consistency.py`)
+        - [ ] **Documentação:** Todos os arquivos criados e verificados
+        - [ ] **Suposições:** Todas marcadas com `[SUPOSIÇÃO]` e justificadas
+        - [ ] **Dados faltantes:** Lista de confirmações necessárias documentada
+
+        ---
+
+        ## W. Riscos e mitigação
+
+        | Risco | Probabilidade | Impacto | Mitigação |
+        |-------|---------------|--------|-----------|
+        | Duplicatas em escrita (modo `update` escreve múltiplas vezes) | Alta | Alto | Implementar deduplicação por chave natural; validar com testes |
+        | Leitura suja (consumidor lê dados de partição aberta) | Média | Médio | Usar marcador de fechamento; documentar para consumidores |
+        | Inconsistência de billing (eventos perdidos ou duplicados) | Média | Alto | Usar staging+merge; validar completude; testes de equivalência |
+        | Problema de arquivos pequenos (muitos arquivos, queries lentas) | Alta | Médio | Implementar compactação; monitorar tamanho de arquivo |
+        | Custo de compute aumenta (streaming 24/7 vs batch 1h/dia) | Alta | Médio | Aceitar custo adicional (13%); ROI é positivo |
+        | Compactação é muito cara (rewrite de dados) | Média | Médio | Compactar apenas dados antigos (> 7 dias); usar Delta Lake se possível |
+        | Consumidores não conseguem lidar com modo `update` | Média | Médio | Testar com Sentinel, Cerebro, Pepper; ajustar queries se necessário |
+        | Partição não fecha (marcador não é criado) | Baixa | Médio | Implementar verificação de fechamento; alertar se partição não fecha |
+        | Escrita falha (erro de I/O, disco cheio) | Baixa | Alto | Implementar retry; monitorar espaço em disco; alertar se falha |
+        | Testes de escrita falham (deduplicação não funciona) | Média | Alto | Investigar causa raiz; ajustar lógica de deduplicação; revalidar |
+
+        ---
+
+        ## Dados faltantes e confirmações necessárias
+
+        ### Dados que faltam:
+        1. **Tamanho real de arquivo por tabela:** Qual é o tamanho médio de arquivo em Parquet? (Necessário para estimar compactação)
+        2. **Frequência real de escrita:** Com que frequência streaming escreve? (Necessário para estimar número de arquivos)
+        3. **Custo real de compute:** Qual é o custo real por nó/hora? (Necessário para análise de custo)
+        4. **Custo real de armazenamento:** Qual é o custo real por GB/mês? (Necessário para análise de custo)
+        5. **Capacidade de consumidores:** Conseguem processar dados a cada 30 s? (Necessário para validar com Sentinel, Cerebro, Pepper)
+        6. **Política de retenção:** Quantos dias de dados devem ser retidos? (Necessário para estimar armazenamento)
+        7. **SLA de latência:** Qual é o SLA de latência para cada consumidor? (Necessário para definir lag de leitura)
+
+        ### Confirmações que derrubariam/validariam escolhas futuras:
+        - Se **tamanho de arquivo < 10 MB**, compactação é necessária
+        - Se **número de arquivos > 1000/hora**, compactação é urgente
+        - Se **custo de compute > $2k/mês**, considerar otimizações
+        - Se **consumidores não conseguem lidar com modo `update`**, usar modo `append` com reprocessamento
+        - Se **SLA de latência < 5 min**, usar lag de leitura menor
+        - Se **política de retenção > 180 dias**, custo de armazenamento é alto
+
+        ---
+
+        ## Suposições marcadas
+
+        | # | Suposição | Razão | Confirmação necessária |
+        |---|-----------|-------|------------------------|
+        | [SUPOSIÇÃO-1] | Volume de eventos: 1B/dia | Baseado em 11.6k eventos/s | Confirmar volume real |
+        | [SUPOSIÇÃO-2] | Tamanho médio de evento: 500 bytes | Típico para eventos de métrica | Confirmar tamanho real |
+        | [SUPOSIÇÃO-3] | Retenção de dados: 90 dias | Típico para observabilidade | Confirmar política de retenção |
+        | [SUPOSIÇÃO-4] | Custo de armazenamento: $0.023/GB/mês | Preço S3 Standard | Confirmar custo real |
+        | [SUPOSIÇÃO-5] | Custo de compute: $0.50/hora por nó | Preço típico de Spark | Confirmar custo real |
+        | [SUPOSIÇÃO-6] | Cluster Spark: 4 nós | Baseado em volume de dados | Confirmar tamanho real de cluster |
+        | [SUPOSIÇÃO-7] | Tamanho médio de arquivo: 20 MB | Típico para Parquet | Confirmar tamanho real |
+        | [SUPOSIÇÃO-8] | Frequência de escrita: 30 s | Baseado em Etapa 4 | Confirmar frequência real |
+        | [SUPOSIÇÃO-9] | Lag de leitura: 5 min | Trade-off entre latência e consistência | Confirmar SLA de latência |
+        | [SUPOSIÇÃO-10] | Compactação: 1× por dia | Baseado em custo-benefício | Confirmar frequência ideal |
+
+        ---
+
+        ## Próximos passos (Etapa 6)
+
+        Após conclusão desta etapa, a escrita incremental alimentará:
+        - **Etapa 6:** Validação de equivalência com dados históricos (streaming vs batch)
+        - **Etapa 7–10:** Migração gradual com canary, validação de consumidores, rollback

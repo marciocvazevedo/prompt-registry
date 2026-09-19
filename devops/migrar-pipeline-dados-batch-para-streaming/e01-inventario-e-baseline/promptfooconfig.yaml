@@ -1,0 +1,41 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 16184
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://../rubric/judge-forge-streaming.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a etapa de inventário e Baseline da cadeia Least-to-Most de migração do Forge (batch -> event-driven)
+        conforme a rubrica C1-C4, o gabarito e a regra de decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      SISTEMA: Forge
+      FONTE_EVENTOS: Relay
+      DW: data warehouse do Forge
+      CONSUMIDORES: Sentinel (tabelas agregadas), Cerebro (índice de eventos transformados), relatórios de billing da Pepper (execução de madrugada)
+      JANELA_ATUAL: 60 min
+      DURACAO_JOB: ~40 min
+      N_ETAPAS: 14
+      ENGINE: Spark
+      PARTICIONAMENTO: por hora
+      LATENCIA_ALVO: 2 min (p95, do evento no Relay até consultável no DW)
+      TAMANHO_MICRO_LOTE: 30 s
+      AMBIENTE: staging → produção
+      JANELA_DUAL_RUN: 14 dias
+      FATIA_CUTOVER: por tenant, começando pelos 5 menores
+      TOLERANCIA_DIVERGENCIA: 0,1% das linhas por hora
+      FORMATO_SAIDA: Markdown com passos numerados
+      etapa_numero: 1
+      etapa_nome: Inventário e baseline

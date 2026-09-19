@@ -1,0 +1,4233 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 40000
+      stream: true
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://../rubric/judge-forge-streaming.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a etapa de cutover incremental e desligamento do batch da cadeia Least-to-Most de migração do Forge (batch -> event-driven)
+        conforme a rubrica C1-C4, o gabarito e a regra de decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      SISTEMA: Forge
+      FONTE_EVENTOS: Relay
+      DW: data warehouse do Forge
+      CONSUMIDORES: Sentinel (tabelas agregadas), Cerebro (índice de eventos transformados), relatórios de billing da Pepper (execução de madrugada)
+      JANELA_ATUAL: 60 min
+      DURACAO_JOB: ~40 min
+      N_ETAPAS: 14
+      ENGINE: Spark
+      PARTICIONAMENTO: por hora
+      LATENCIA_ALVO: 2 min (p95, do evento no Relay até consultável no DW)
+      TAMANHO_MICRO_LOTE: 30 s
+      AMBIENTE: staging → produção
+      JANELA_DUAL_RUN: 14 dias
+      FATIA_CUTOVER: por tenant, começando pelos 5 menores
+      TOLERANCIA_DIVERGENCIA: 0,1% das linhas por hora
+      FORMATO_SAIDA: Markdown com passos numerados
+      etapa_numero: 10
+      etapa_nome: Cutover incremental e desligamento do batch
+      INSUMO_ETAPA_7: |
+        {% raw %}
+        # Etapa 7 de 10: Recuperação de Falhas, Replay e Backfill
+
+        **Depende de:** Etapas 3, 5 e 6.
+
+        ---
+
+        ## 0. Pré-requisitos
+
+        - [ ] Acesso de leitura/escrita ao repositório de configuração do Forge (`forge/config/`, `forge/jobs/`)
+        - [ ] Acesso ao console/API do Relay para inspecionar tópicos, partições, offsets, DLQ
+        - [ ] Acesso ao cluster Spark em staging e produção
+        - [ ] Acesso ao DW (Parquet em `/data/forge/` ou equivalente SQL)
+        - [ ] Acesso a logs de streaming (últimos 30 dias) para análise de falhas
+        - [ ] Acesso a métricas de Prometheus/Grafana para monitoramento de falhas
+        - [ ] Contato técnico confirmado no time de Relay para validar DLQ e reprocessamento
+        - [ ] Contato técnico confirmado no time de on-call para runbook de plantão
+        - [ ] Resultado da Etapa 3 disponível: contrato de consumo do Relay (tópico, partições, retenção, offsets)
+        - [ ] Resultado da Etapa 5 disponível: estratégia de escrita incremental (deduplicação, merge, compactação)
+        - [ ] Resultado da Etapa 6 disponível: validação de equivalência (batch vs streaming)
+        - [ ] Ferramentas: `kafka-consumer-groups`, `kafka-console-consumer`, `spark-submit`, `curl`, editor de YAML, `git`
+        - [ ] Permissão para criar tópicos DLQ no Relay
+        - [ ] Permissão para resetar offsets do consumer group (coordenar com time de Relay)
+        - [ ] Permissão para executar jobs de replay/backfill em produção
+        - [ ] Acesso a alertas e dashboards de monitoramento (Prometheus, Grafana, PagerDuty)
+        - [ ] Política de retenção de dados no DW (ex: 90 dias)
+        - [ ] Política de retenção de logs (ex: 30 dias)
+
+        ---
+
+        ## 1. Classifique tipos de falha e defina resposta para cada uma
+
+        **Ação:** Criar matriz de classificação de falhas com critérios de detecção e resposta automática/manual.
+
+        **Onde:** Arquivo `forge/config/failure-classification.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Classificação de Falhas e Respostas — Forge Streaming
+
+        ## Matriz de Classificação
+
+        ### Tipo 1: Evento Inválido (Erro de Dados)
+        **Definição:** Evento não passa em validação de schema ou regras de negócio.
+
+        **Exemplos:**
+        - Campo obrigatório ausente (ex: `tenant_id` é NULL)
+        - Tipo de dado incorreto (ex: `timestamp` é string em vez de long)
+        - Valor fora de intervalo (ex: `metric_value` é negativo)
+        - Schema mismatch (ex: novo campo sem default)
+
+        **Detecção:**
+        ```python
+        # Erro durante desserialização ou validação
+        try:
+            df_parsed = df.select(from_json(col("value"), EVENT_SCHEMA))
+        except Exception as e:
+            if "schema" in str(e).lower() or "null" in str(e).lower():
+                return "INVALID_EVENT"
+        ```
+
+        **Métrica:**
+        ```
+        forge_invalid_events_total (counter)
+        forge_invalid_events_by_reason (histogram: schema_mismatch, null_field, type_error, value_error)
+        ```
+
+        **Resposta Automática:**
+        1. Enviar evento para DLQ (`forge-events-invalid`)
+        2. Incrementar métrica `forge_invalid_events_total`
+        3. Continuar processando próximos eventos (não bloquear)
+        4. Alertar se taxa > 100 eventos/min (possível problema de schema)
+
+        **Resposta Manual (On-Call):**
+        1. Inspecionar DLQ para entender padrão de erro
+        2. Se schema mismatch: coordenar com time de Relay para validar schema
+        3. Se valor inválido: investigar origem dos dados (cliente enviando dados ruins?)
+        4. Reprocessar DLQ após correção (ver seção 3: Replay)
+
+        **Exemplo de Implementação:**
+        ```python
+        def handle_invalid_event(df, batch_id):
+            """Separar eventos inválidos para DLQ"""
+            # Tentar desserializar
+            try:
+                df_valid = df.select(from_json(col("value"), EVENT_SCHEMA).alias("event"))
+                df_valid = df_valid.filter(col("event").isNotNull())
+            except:
+                df_valid = spark.createDataFrame([], df.schema)
+            
+            # Eventos inválidos = todos os que não passaram
+            df_invalid = df.exceptAll(df_valid)
+            
+            # Enviar para DLQ
+            if df_invalid.count() > 0:
+                df_invalid.write.format("kafka") \
+                    .option("kafka.bootstrap.servers", "<relay-broker>") \
+                    .option("topic", "forge-events-invalid") \
+                    .mode("append") \
+                    .save()
+                logger.warning(f"Batch {batch_id}: {df_invalid.count()} eventos inválidos enviados para DLQ")
+            
+            return df_valid
+        ```
+
+        ---
+
+        ### Tipo 2: Falha Transitória (Erro Temporário)
+        **Definição:** Erro que é provável que desapareça se reprocessado (ex: timeout de rede, recurso temporariamente indisponível).
+
+        **Exemplos:**
+        - Timeout ao conectar no DW (connection timeout)
+        - Disco cheio temporariamente (espaço liberado após compactação)
+        - Memória insuficiente (GC pause, depois recupera)
+        - Broker do Relay indisponível (falha de nó, depois recupera)
+        - Rate limit do DW (muitas queries simultâneas)
+
+        **Detecção:**
+        ```python
+        # Erro é transitório se:
+        # 1. Mensagem contém "timeout", "temporarily", "unavailable", "connection refused"
+        # 2. Erro é de I/O (não de lógica)
+        # 3. Retry anterior foi bem-sucedido
+        def is_transient_error(exception):
+            msg = str(exception).lower()
+            transient_keywords = ["timeout", "temporarily", "unavailable", "connection refused", "try again"]
+            return any(keyword in msg for keyword in transient_keywords)
+        ```
+
+        **Métrica:**
+        ```
+        forge_transient_errors_total (counter)
+        forge_transient_errors_by_type (histogram: timeout, unavailable, connection_refused, rate_limit)
+        forge_transient_error_retry_attempts (histogram)
+        ```
+
+        **Resposta Automática:**
+        1. Implementar retry com backoff exponencial (1s, 2s, 4s, 8s, 16s)
+        2. Máximo 5 tentativas
+        3. Se todas as tentativas falharem, enviar para DLQ (`forge-events-retry-exhausted`)
+        4. Alertar se taxa de retry > 10% de eventos
+
+        **Resposta Manual (On-Call):**
+        1. Verificar status do DW (CPU, memória, conexões)
+        2. Verificar status do Relay (brokers, network)
+        3. Se problema persiste > 5 min, escalar para time de infraestrutura
+        4. Reprocessar DLQ após resolução (ver seção 3: Replay)
+
+        **Exemplo de Implementação:**
+        ```python
+        def retry_with_backoff(func, max_retries=5):
+            """Retry com backoff exponencial"""
+            for attempt in range(max_retries):
+                try:
+                    return func()
+                except Exception as e:
+                    if not is_transient_error(e):
+                        raise  # Não é transitório, falhar imediatamente
+                    
+                    if attempt == max_retries - 1:
+                        logger.error(f"Falha após {max_retries} tentativas: {e}")
+                        raise
+                    
+                    wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 segundos
+                    logger.warning(f"Tentativa {attempt + 1}/{max_retries} falhou, aguardando {wait_time}s: {e}")
+                    time.sleep(wait_time)
+
+        # Usar em escrita
+        def write_with_retry(df, table_name):
+            retry_with_backoff(
+                lambda: df.write.mode("append").parquet(f"/data/forge/{table_name}")
+            )
+        ```
+
+        ---
+
+        ### Tipo 3: Falha de Dependência (Erro Externo)
+        **Definição:** Erro causado por falha em sistema externo (DW, Relay, Schema Registry, etc).
+
+        **Exemplos:**
+        - DW está offline (manutenção programada)
+        - Relay está offline (falha de cluster)
+        - Schema Registry está offline
+        - Elasticsearch (Cerebro) está offline
+        - Banco de dados de configuração está offline
+
+        **Detecção:**
+        ```python
+        # Erro é de dependência se:
+        # 1. Mensagem contém nome de serviço externo
+        # 2. Erro é de conectividade (não de lógica)
+        # 3. Afeta múltiplos eventos (não apenas um)
+        def is_dependency_error(exception, service_name):
+            msg = str(exception).lower()
+            return service_name.lower() in msg or "connection refused" in msg
+        ```
+
+        **Métrica:**
+        ```
+        forge_dependency_errors_total (counter, label: service)
+        forge_dependency_errors_by_service (histogram: dw, relay, schema_registry, cerebro, config_db)
+        forge_dependency_error_duration_seconds (gauge, label: service)
+        ```
+
+        **Resposta Automática:**
+        1. Parar processamento (não enviar para DLQ, pois pode ser transitório)
+        2. Aguardar recuperação da dependência (com timeout de 5 min)
+        3. Se dependência não recupera em 5 min, alertar on-call
+        4. Manter offsets no Relay (não fazer commit) para reprocessar depois
+
+        **Resposta Manual (On-Call):**
+        1. Verificar status da dependência (dashboard, logs, health check)
+        2. Se manutenção programada: aguardar conclusão
+        3. Se falha não programada: escalar para time responsável
+        4. Após recuperação: job de streaming retoma automaticamente (offsets não foram commitados)
+
+        **Exemplo de Implementação:**
+        ```python
+        def check_dependency_health(service_name, health_check_url):
+            """Verificar saúde de dependência"""
+            try:
+                response = requests.get(health_check_url, timeout=5)
+                return response.status_code == 200
+            except:
+                return False
+
+        def wait_for_dependency(service_name, health_check_url, max_wait_seconds=300):
+            """Aguardar recuperação de dependência"""
+            start_time = time.time()
+            while time.time() - start_time < max_wait_seconds:
+                if check_dependency_health(service_name, health_check_url):
+                    logger.info(f"{service_name} recuperado")
+                    return True
+                logger.warning(f"{service_name} ainda indisponível, aguardando...")
+                time.sleep(10)
+            
+            logger.error(f"{service_name} não recuperou em {max_wait_seconds}s")
+            return False
+
+        # Usar em escrita
+        def write_with_dependency_check(df, table_name, dw_health_url):
+            if not wait_for_dependency("DW", dw_health_url):
+                raise Exception("DW indisponível, não commitando offsets")
+            
+            df.write.mode("append").parquet(f"/data/forge/{table_name}")
+        ```
+
+        ---
+
+        ### Tipo 4: Falha de Deploy (Erro de Código)
+        **Definição:** Erro causado por bug no código ou configuração incorreta.
+
+        **Exemplos:**
+        - NullPointerException em transformação
+        - Divisão por zero em cálculo
+        - Índice fora de intervalo em array
+        - Configuração incorreta (ex: caminho de arquivo errado)
+        - Incompatibilidade de versão de biblioteca
+
+        **Detecção:**
+        ```python
+        # Erro é de deploy se:
+        # 1. Mensagem contém "NullPointerException", "IndexOutOfBoundsException", "ZeroDivisionError"
+        # 2. Erro é de lógica (não de I/O)
+        # 3. Afeta todos os eventos (não apenas alguns)
+        def is_deploy_error(exception):
+            msg = str(exception).lower()
+            deploy_keywords = ["nullpointer", "indexoutofbounds", "zerodivision", "attributeerror", "keyerror"]
+            return any(keyword in msg for keyword in deploy_keywords)
+        ```
+
+        **Métrica:**
+        ```
+        forge_deploy_errors_total (counter)
+        forge_deploy_errors_by_type (histogram: nullpointer, indexoutofbounds, zerodivision, etc)
+        ```
+
+        **Resposta Automática:**
+        1. Parar processamento imediatamente (não continuar, pois vai falhar em todos os eventos)
+        2. Alertar on-call com severidade CRITICAL
+        3. Não enviar para DLQ (pois reprocessamento também falhará)
+        4. Não fazer commit de offsets (para reprocessar depois de fix)
+
+        **Resposta Manual (On-Call):**
+        1. Verificar logs de erro para entender causa
+        2. Fazer rollback para versão anterior (se possível)
+        3. Ou fazer fix rápido e redeploy
+        4. Após fix: job de streaming retoma automaticamente (offsets não foram commitados)
+
+        **Exemplo de Implementação:**
+        ```python
+        def safe_transform(df, transform_func):
+            """Executar transformação com detecção de erro de deploy"""
+            try:
+                return transform_func(df)
+            except Exception as e:
+                if is_deploy_error(e):
+                    logger.critical(f"Deploy error detectado: {e}")
+                    # Alertar on-call
+                    send_alert("CRITICAL", f"Deploy error: {e}")
+                    # Parar processamento
+                    raise
+                else:
+                    # Outro tipo de erro, continuar
+                    logger.warning(f"Erro não-crítico: {e}")
+                    return df
+        ```
+
+        ---
+
+        ### Tipo 5: Falha de Lógica de Negócio (Erro de Regra)
+        **Definição:** Evento viola regra de negócio (ex: tenant não existe, métrica não é conhecida).
+
+        **Exemplos:**
+        - Tenant não existe no banco de dados de configuração
+        - Métrica não é conhecida (não está em lista de métricas válidas)
+        - Valor de métrica viola SLA (ex: latência > 1 hora)
+        - Evento é duplicado (mesmo `event_id` já foi processado)
+
+        **Detecção:**
+        ```python
+        # Erro é de lógica de negócio se:
+        # 1. Validação de regra falha (ex: tenant não existe)
+        # 2. Evento é duplicado
+        # 3. Valor viola SLA
+        def validate_business_logic(event, config):
+            """Validar regras de negócio"""
+            # Verificar se tenant existe
+            if event["tenant_id"] not in config["valid_tenants"]:
+                return False, "UNKNOWN_TENANT"
+            
+            # Verificar se métrica é conhecida
+            if event["metric_name"] not in config["valid_metrics"]:
+                return False, "UNKNOWN_METRIC"
+            
+            # Verificar se valor viola SLA
+            if event["timestamp"] < (time.time() - 3600):  # > 1 hora atrás
+                return False, "EVENT_TOO_OLD"
+            
+            return True, None
+        ```
+
+        **Métrica:**
+        ```
+        forge_business_logic_errors_total (counter)
+        forge_business_logic_errors_by_reason (histogram: unknown_tenant, unknown_metric, event_too_old, duplicate)
+        ```
+
+        **Resposta Automática:**
+        1. Enviar evento para DLQ (`forge-events-business-logic-error`)
+        2. Incrementar métrica
+        3. Continuar processando próximos eventos
+        4. Alertar se taxa > 1000 eventos/min (possível problema de configuração)
+
+        **Resposta Manual (On-Call):**
+        1. Inspecionar DLQ para entender padrão de erro
+        2. Se tenant desconhecido: verificar se tenant foi criado corretamente
+        3. Se métrica desconhecida: verificar se métrica foi registrada no config
+        4. Se evento muito antigo: verificar se há atraso no pipeline
+        5. Reprocessar DLQ após correção (ver seção 3: Replay)
+
+        ---
+
+        ## Resumo de Classificação
+
+        | Tipo | Causa | Detecção | Resposta Automática | Resposta Manual |
+        |------|-------|----------|-------------------|-----------------|
+        | **1. Evento Inválido** | Dados ruins | Schema validation | → DLQ | Inspecionar, corrigir origem, replay |
+        | **2. Falha Transitória** | Erro temporário | Timeout, unavailable | Retry com backoff | Verificar infraestrutura, replay |
+        | **3. Falha de Dependência** | Serviço externo offline | Connection refused | Aguardar, não commit | Verificar serviço, aguardar recuperação |
+        | **4. Falha de Deploy** | Bug no código | NullPointer, IndexError | Parar, alertar CRITICAL | Rollback ou fix, redeploy |
+        | **5. Falha de Lógica** | Regra de negócio | Validação falha | → DLQ | Inspecionar, corrigir config, replay |
+
+        ---
+
+        ## Matriz de Decisão
+
+        ```python
+        def classify_and_respond_to_failure(exception, event, config):
+            """Classificar falha e executar resposta automática"""
+            
+            # Tipo 1: Evento Inválido
+            if is_invalid_event(event):
+                send_to_dlq(event, "forge-events-invalid", "INVALID_EVENT")
+                increment_metric("forge_invalid_events_total")
+                return "SKIP"  # Continuar processando
+            
+            # Tipo 2: Falha Transitória
+            if is_transient_error(exception):
+                try:
+                    return retry_with_backoff(lambda: process_event(event))
+                except:
+                    send_to_dlq(event, "forge-events-retry-exhausted", "TRANSIENT_ERROR")
+                    increment_metric("forge_transient_errors_total")
+                    return "SKIP"
+            
+            # Tipo 3: Falha de Dependência
+            if is_dependency_error(exception):
+                if wait_for_dependency(get_service_name(exception)):
+                    return retry_with_backoff(lambda: process_event(event))
+                else:
+                    logger.error("Dependência não recuperou, não commitando offsets")
+                    return "STOP"  # Parar processamento
+            
+            # Tipo 4: Falha de Deploy
+            if is_deploy_error(exception):
+                send_alert("CRITICAL", f"Deploy error: {exception}")
+                return "STOP"  # Parar processamento
+            
+            # Tipo 5: Falha de Lógica de Negócio
+            if is_business_logic_error(event, config):
+                send_to_dlq(event, "forge-events-business-logic-error", "BUSINESS_LOGIC_ERROR")
+                increment_metric("forge_business_logic_errors_total")
+                return "SKIP"
+            
+            # Erro desconhecido
+            logger.error(f"Erro desconhecido: {exception}")
+            send_to_dlq(event, "forge-events-unknown-error", "UNKNOWN_ERROR")
+            return "SKIP"
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que classificação está documentada
+        grep -E "Tipo [1-5]:|Resposta Automática:|Resposta Manual:" forge/config/failure-classification.md | wc -l
+        # Esperado: > 30 linhas
+        ```
+
+        ---
+
+        ## 2. Implemente política de retentativa e DLQ
+
+        **Ação:** Criar tópicos DLQ no Relay e implementar lógica de retry com backoff exponencial.
+
+        **Onde:** Configuração do Relay e código de streaming (`forge/jobs/streaming_with_dlq.py`).
+
+        **Procedimento:**
+
+        ### 2.1 Criar Tópicos DLQ no Relay
+
+        ```bash
+        # Criar tópicos DLQ
+        RELAY_BROKER="<relay-broker>"
+
+        # DLQ para eventos inválidos
+        kafka-topics --bootstrap-server $RELAY_BROKER \
+        --create \
+        --topic forge-events-invalid \
+        --partitions 8 \
+        --replication-factor 3 \
+        --config retention.ms=2592000000 \
+        --config compression.type=snappy
+
+        # DLQ para retry exhausted
+        kafka-topics --bootstrap-server $RELAY_BROKER \
+        --create \
+        --topic forge-events-retry-exhausted \
+        --partitions 8 \
+        --replication-factor 3 \
+        --config retention.ms=2592000000 \
+        --config compression.type=snappy
+
+        # DLQ para erros de lógica de negócio
+        kafka-topics --bootstrap-server $RELAY_BROKER \
+        --create \
+        --topic forge-events-business-logic-error \
+        --partitions 8 \
+        --replication-factor 3 \
+        --config retention.ms=2592000000 \
+        --config compression.type=snappy
+
+        # DLQ para erros desconhecidos
+        kafka-topics --bootstrap-server $RELAY_BROKER \
+        --create \
+        --topic forge-events-unknown-error \
+        --partitions 8 \
+        --replication-factor 3 \
+        --config retention.ms=2592000000 \
+        --config compression.type=snappy
+
+        # Verificar que tópicos foram criados
+        kafka-topics --bootstrap-server $RELAY_BROKER --list | grep forge-events
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que tópicos DLQ existem
+        kafka-topics --bootstrap-server $RELAY_BROKER --describe --topic forge-events-invalid
+        # Esperado: tópico existe com 8 partições, replication factor 3
+        ```
+
+        ### 2.2 Implementar Retry com Backoff Exponencial
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Streaming com Retry e DLQ
+        Implementa política de retentativa e envio para DLQ.
+        """
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, from_json, schema_of_json, current_timestamp, lit, when
+        )
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, MapType
+        import logging
+        import time
+        from datetime import datetime
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        # Configuração
+        RELAY_BROKER = "<relay-broker>"
+        RELAY_TOPIC = "forge-events-raw"
+        CONSUMER_GROUP = "forge-streaming-v1"
+        DLQ_TOPICS = {
+            "INVALID_EVENT": "forge-events-invalid",
+            "TRANSIENT_ERROR": "forge-events-retry-exhausted",
+            "BUSINESS_LOGIC_ERROR": "forge-events-business-logic-error",
+            "UNKNOWN_ERROR": "forge-events-unknown-error",
+        }
+
+        # Schema do evento
+        EVENT_SCHEMA = StructType([
+            StructField("event_id", StringType(), False),
+            StructField("tenant_id", StringType(), False),
+            StructField("timestamp", LongType(), False),
+            StructField("service_id", StringType(), False),
+            StructField("metric_name", StringType(), False),
+            StructField("metric_value", DoubleType(), False),
+            StructField("tags", MapType(StringType(), StringType()), True),
+        ])
+
+        class StreamingWithDLQ:
+            """Streaming com retry e DLQ"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+                self.retry_config = {
+                    "max_retries": 5,
+                    "backoff_base": 2,  # 2^n segundos
+                    "max_backoff": 60,  # máximo 60 segundos
+                }
+            
+            def is_invalid_event(self, event):
+                """Verificar se evento é inválido"""
+                if event is None:
+                    return True
+                if event.get("event_id") is None or event.get("tenant_id") is None:
+                    return True
+                if event.get("timestamp") is None:
+                    return True
+                return False
+            
+            def is_business_logic_error(self, event, config):
+                """Verificar se evento viola regra de negócio"""
+                # Verificar se tenant existe
+                if event.get("tenant_id") not in config.get("valid_tenants", []):
+                    return True
+                # Verificar se métrica é conhecida
+                if event.get("metric_name") not in config.get("valid_metrics", []):
+                    return True
+                # Verificar se evento é muito antigo (> 1 hora)
+                if event.get("timestamp") < (time.time() * 1000 - 3600000):
+                    return True
+                return False
+            
+            def classify_error(self, exception, event, config):
+                """Classificar tipo de erro"""
+                msg = str(exception).lower()
+                
+                # Tipo 1: Evento Inválido
+                if self.is_invalid_event(event):
+                    return "INVALID_EVENT"
+                
+                # Tipo 2: Falha Transitória
+                transient_keywords = ["timeout", "temporarily", "unavailable", "connection refused"]
+                if any(keyword in msg for keyword in transient_keywords):
+                    return "TRANSIENT_ERROR"
+                
+                # Tipo 3: Falha de Dependência
+                if "connection refused" in msg or "connection timeout" in msg:
+                    return "DEPENDENCY_ERROR"
+                
+                # Tipo 4: Falha de Deploy
+                deploy_keywords = ["nullpointer", "indexoutofbounds", "zerodivision", "attributeerror", "keyerror"]
+                if any(keyword in msg for keyword in deploy_keywords):
+                    return "DEPLOY_ERROR"
+                
+                # Tipo 5: Falha de Lógica de Negócio
+                if self.is_business_logic_error(event, config):
+                    return "BUSINESS_LOGIC_ERROR"
+                
+                return "UNKNOWN_ERROR"
+            
+            def send_to_dlq(self, df, error_type, dlq_topic):
+                """Enviar eventos para DLQ"""
+                if df.count() == 0:
+                    return
+                
+                # Adicionar metadados de erro
+                df_with_metadata = df.withColumn("error_type", lit(error_type)) \
+                    .withColumn("error_timestamp", current_timestamp()) \
+                    .withColumn("dlq_topic", lit(dlq_topic))
+                
+                # Enviar para DLQ
+                df_with_metadata.select(
+                    col("key"),
+                    col("value"),
+                    col("error_type"),
+                    col("error_timestamp")
+                ).write.format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("topic", dlq_topic) \
+                    .mode("append") \
+                    .save()
+                
+                self.logger.warning(f"Enviados {df.count()} eventos para DLQ ({dlq_topic})")
+            
+            def process_with_retry(self, df, batch_id, config):
+                """Processar eventos com retry"""
+                self.logger.info(f"Batch {batch_id}: Processando com retry")
+                
+                # Separar eventos válidos de inválidos
+                df_valid = df.filter(~self.is_invalid_event(col("event")))
+                df_invalid = df.filter(self.is_invalid_event(col("event")))
+                
+                # Enviar inválidos para DLQ
+                if df_invalid.count() > 0:
+                    self.send_to_dlq(df_invalid, "INVALID_EVENT", DLQ_TOPICS["INVALID_EVENT"])
+                
+                # Separar eventos que violam lógica de negócio
+                df_business_logic_error = df_valid.filter(
+                    self.is_business_logic_error(col("event"), config)
+                )
+                df_valid = df_valid.filter(
+                    ~self.is_business_logic_error(col("event"), config)
+                )
+                
+                # Enviar erros de lógica para DLQ
+                if df_business_logic_error.count() > 0:
+                    self.send_to_dlq(df_business_logic_error, "BUSINESS_LOGIC_ERROR", 
+                                  DLQ_TOPICS["BUSINESS_LOGIC_ERROR"])
+                
+                return df_valid
+            
+            def create_spark_session(self):
+                """Cria sessão Spark"""
+                return SparkSession.builder \
+                    .appName("forge-streaming-with-dlq") \
+                    .config("spark.streaming.kafka.maxRatePerPartition", "2000") \
+                    .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = SparkSession.builder \
+                .appName("forge-streaming-with-dlq") \
+                .getOrCreate()
+            
+            processor = StreamingWithDLQ(spark)
+            
+            # Ler do Relay
+            df = spark.readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                .option("subscribe", RELAY_TOPIC) \
+                .option("startingOffsets", "earliest") \
+                .option("kafka.group.id", CONSUMER_GROUP) \
+                .load()
+            
+            # Desserializar
+            df_parsed = df.select(
+                col("key").cast(StringType()).alias("partition_key"),
+                from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                col("timestamp").alias("kafka_timestamp")
+            ).select(
+                col("partition_key"),
+                col("event.*"),
+                col("kafka_timestamp")
+            )
+            
+            # Processar com retry
+            config = {"valid_tenants": ["t1", "t2"], "valid_metrics": ["http.requests", "latency"]}
+            df_processed = df_parsed.transform(
+                lambda df: processor.process_with_retry(df, 0, config)
+            )
+            
+            # Escrever no DW
+            query = df_processed.writeStream \
+                .format("parquet") \
+                .option("path", "/data/forge/aggregated") \
+                .option("checkpointLocation", "/data/forge/checkpoint/aggregated") \
+                .outputMode("append") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            
+            query.awaitTermination()
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar com dados inválidos
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/streaming_with_dlq.py
+
+        # Verificar que eventos inválidos foram enviados para DLQ
+        kafka-console-consumer --bootstrap-server $RELAY_BROKER \
+        --topic forge-events-invalid \
+        --max-messages 10 \
+        --from-beginning
+        # Esperado: eventos inválidos aparecem no DLQ
+        ```
+
+        ---
+
+        ## 3. Implemente procedimento de replay a partir de offset ou instante
+
+        **Ação:** Criar job de replay que permite reprocessar eventos a partir de um offset ou timestamp específico.
+
+        **Onde:** Arquivo `forge/jobs/replay_events.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Job de Replay
+        Reprocessa eventos a partir de um offset ou timestamp específico.
+        Suporta replay por tenant, por tópico, por janela.
+        """
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, from_json, to_timestamp, window, current_timestamp, lit
+        )
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, MapType
+        import logging
+        from datetime import datetime, timedelta
+        import argparse
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        # Configuração
+        RELAY_BROKER = "<relay-broker>"
+        RELAY_TOPIC = "forge-events-raw"
+        CONSUMER_GROUP_REPLAY = "forge-replay-v1"
+
+        # Schema do evento
+        EVENT_SCHEMA = StructType([
+            StructField("event_id", StringType(), False),
+            StructField("tenant_id", StringType(), False),
+            StructField("timestamp", LongType(), False),
+            StructField("service_id", StringType(), False),
+            StructField("metric_name", StringType(), False),
+            StructField("metric_value", DoubleType(), False),
+            StructField("tags", MapType(StringType(), StringType()), True),
+        ])
+
+        class ReplayJob:
+            """Job de replay de eventos"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            def replay_from_offset(self, partition, offset, tenant_id=None, duration_minutes=60):
+                """
+                Replay a partir de um offset específico.
+                
+                Args:
+                    partition: Partição do Relay (0-31)
+                    offset: Offset inicial
+                    tenant_id: Filtrar por tenant (opcional)
+                    duration_minutes: Duração do replay em minutos
+                """
+                self.logger.info(f"Replay: partition={partition}, offset={offset}, tenant_id={tenant_id}, duration={duration_minutes}min")
+                
+                # Ler do Relay a partir do offset
+                df = self.spark.readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("subscribe", RELAY_TOPIC) \
+                    .option("kafka.group.id", CONSUMER_GROUP_REPLAY) \
+                    .option("startingOffsets", f'{{"forge-events-raw":{{{partition}:{offset}}}}}') \
+                    .load()
+                
+                # Desserializar
+                df_parsed = df.select(
+                    col("key").cast(StringType()).alias("partition_key"),
+                    from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                    col("timestamp").alias("kafka_timestamp")
+                ).select(
+                    col("partition_key"),
+                    col("event.*"),
+                    col("kafka_timestamp")
+                )
+                
+                # Filtrar por tenant (se especificado)
+                if tenant_id:
+                    df_parsed = df_parsed.filter(col("tenant_id") == tenant_id)
+                
+                # Adicionar metadados de replay
+                df_with_metadata = df_parsed.withColumn("replay_timestamp", current_timestamp()) \
+                    .withColumn("replay_partition", lit(partition)) \
+                    .withColumn("replay_offset", lit(offset))
+                
+                # Escrever no DW
+                query = df_with_metadata.writeStream \
+                    .format("parquet") \
+                    .option("path", "/data/forge/aggregated_replay") \
+                    .option("checkpointLocation", f"/data/forge/checkpoint/replay_{partition}_{offset}") \
+                    .outputMode("append") \
+                    .trigger(processingTime="30 seconds") \
+                    .start()
+                
+                # Aguardar duração especificada
+                query.awaitTermination(timeout=duration_minutes * 60 * 1000)
+                query.stop()
+                
+                self.logger.info(f"Replay concluído: {query.lastProgress['numInputRows']} eventos processados")
+            
+            def replay_from_timestamp(self, start_timestamp, end_timestamp=None, tenant_id=None):
+                """
+                Replay a partir de um timestamp específico.
+                
+                Args:
+                    start_timestamp: Timestamp inicial (ISO 8601, ex: "2024-01-15T10:00:00Z")
+                    end_timestamp: Timestamp final (opcional, padrão: agora)
+                    tenant_id: Filtrar por tenant (opcional)
+                """
+                self.logger.info(f"Replay: start={start_timestamp}, end={end_timestamp}, tenant_id={tenant_id}")
+                
+                # Converter timestamps
+                start_ts = int(datetime.fromisoformat(start_timestamp.replace("Z", "+00:00")).timestamp() * 1000)
+                if end_timestamp:
+                    end_ts = int(datetime.fromisoformat(end_timestamp.replace("Z", "+00:00")).timestamp() * 1000)
+                else:
+                    end_ts = int(datetime.utcnow().timestamp() * 1000)
+                
+                # Ler do Relay (usar offsets baseados em timestamp)
+                # [SUPOSIÇÃO] Relay suporta busca por timestamp
+                df = self.spark.readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("subscribe", RELAY_TOPIC) \
+                    .option("kafka.group.id", CONSUMER_GROUP_REPLAY) \
+                    .option("startingOffsets", "earliest") \
+                    .load()
+                
+                # Desserializar
+                df_parsed = df.select(
+                    col("key").cast(StringType()).alias("partition_key"),
+                    from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                    col("timestamp").alias("kafka_timestamp")
+                ).select(
+                    col("partition_key"),
+                    col("event.*"),
+                    col("kafka_timestamp")
+                )
+                
+                # Filtrar por timestamp
+                df_filtered = df_parsed.filter(
+                    (col("timestamp") >= start_ts) & (col("timestamp") <= end_ts)
+                )
+                
+                # Filtrar por tenant (se especificado)
+                if tenant_id:
+                    df_filtered = df_filtered.filter(col("tenant_id") == tenant_id)
+                
+                # Adicionar metadados de replay
+                df_with_metadata = df_filtered.withColumn("replay_timestamp", current_timestamp()) \
+                    .withColumn("replay_start_ts", lit(start_ts)) \
+                    .withColumn("replay_end_ts", lit(end_ts))
+                
+                # Escrever no DW
+                query = df_with_metadata.writeStream \
+                    .format("parquet") \
+                    .option("path", "/data/forge/aggregated_replay") \
+                    .option("checkpointLocation", f"/data/forge/checkpoint/replay_{start_ts}_{end_ts}") \
+                    .outputMode("append") \
+                    .trigger(processingTime="30 seconds") \
+                    .start()
+                
+                query.awaitTermination()
+                query.stop()
+                
+                self.logger.info(f"Replay concluído: {query.lastProgress['numInputRows']} eventos processados")
+            
+            def replay_dlq(self, dlq_topic, limit=None):
+                """
+                Replay de eventos da DLQ.
+                
+                Args:
+                    dlq_topic: Tópico DLQ (ex: "forge-events-invalid")
+                    limit: Limite de eventos a reprocessar (opcional)
+                """
+                self.logger.info(f"Replay DLQ: topic={dlq_topic}, limit={limit}")
+                
+                # Ler da DLQ
+                df = self.spark.readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("subscribe", dlq_topic) \
+                    .option("kafka.group.id", f"{CONSUMER_GROUP_REPLAY}-dlq") \
+                    .option("startingOffsets", "earliest") \
+                    .load()
+                
+                # Desserializar
+                df_parsed = df.select(
+                    col("key").cast(StringType()).alias("partition_key"),
+                    from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                    col("timestamp").alias("kafka_timestamp")
+                ).select(
+                    col("partition_key"),
+                    col("event.*"),
+                    col("kafka_timestamp")
+                )
+                
+                # Limitar (se especificado)
+                if limit:
+                    df_parsed = df_parsed.limit(limit)
+                
+                # Adicionar metadados de replay
+                df_with_metadata = df_parsed.withColumn("replay_timestamp", current_timestamp()) \
+                    .withColumn("replay_from_dlq", lit(dlq_topic))
+                
+                # Escrever no DW
+                query = df_with_metadata.writeStream \
+                    .format("parquet") \
+                    .option("path", "/data/forge/aggregated_replay") \
+                    .option("checkpointLocation", f"/data/forge/checkpoint/replay_dlq_{dlq_topic}") \
+                    .outputMode("append") \
+                    .trigger(processingTime="30 seconds") \
+                    .start()
+                
+                query.awaitTermination()
+                query.stop()
+                
+                self.logger.info(f"Replay DLQ concluído: {query.lastProgress['numInputRows']} eventos processados")
+
+        def main():
+            """Função principal"""
+            parser = argparse.ArgumentParser(description="Replay de eventos do Forge")
+            parser.add_argument("--mode", choices=["offset", "timestamp", "dlq"], required=True,
+                              help="Modo de replay")
+            parser.add_argument("--partition", type=int, help="Partição (para modo offset)")
+            parser.add_argument("--offset", type=int, help="Offset (para modo offset)")
+            parser.add_argument("--start-timestamp", help="Timestamp inicial (para modo timestamp, ISO 8601)")
+            parser.add_argument("--end-timestamp", help="Timestamp final (para modo timestamp, ISO 8601)")
+            parser.add_argument("--dlq-topic", help="Tópico DLQ (para modo dlq)")
+            parser.add_argument("--tenant-id", help="Filtrar por tenant (opcional)")
+            parser.add_argument("--duration-minutes", type=int, default=60, help="Duração do replay em minutos")
+            parser.add_argument("--limit", type=int, help="Limite de eventos (para modo dlq)")
+            
+            args = parser.parse_args()
+            
+            spark = SparkSession.builder \
+                .appName("forge-replay") \
+                .getOrCreate()
+            
+            replay = ReplayJob(spark)
+            
+            if args.mode == "offset":
+                replay.replay_from_offset(args.partition, args.offset, args.tenant_id, args.duration_minutes)
+            elif args.mode == "timestamp":
+                replay.replay_from_timestamp(args.start_timestamp, args.end_timestamp, args.tenant_id)
+            elif args.mode == "dlq":
+                replay.replay_dlq(args.dlq_topic, args.limit)
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Exemplos de Uso:**
+
+        ```bash
+        # Replay a partir de offset específico
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/replay_events.py \
+        --mode offset \
+        --partition 0 \
+        --offset 1000 \
+        --tenant-id tenant-abc \
+        --duration-minutes 30
+
+        # Replay a partir de timestamp
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/replay_events.py \
+        --mode timestamp \
+        --start-timestamp "2024-01-15T10:00:00Z" \
+        --end-timestamp "2024-01-15T11:00:00Z" \
+        --tenant-id tenant-abc
+
+        # Replay de DLQ
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/replay_events.py \
+        --mode dlq \
+        --dlq-topic forge-events-invalid \
+        --limit 1000
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Verificar que replay foi executado
+        ls -la /data/forge/aggregated_replay/
+        # Esperado: diretório contém arquivos Parquet com eventos reprocessados
+        ```
+
+        ---
+
+        ## 4. Implemente procedimento de backfill histórico
+
+        **Ação:** Criar job de backfill que reprocessa dados históricos sem duplicar com fluxo ao vivo.
+
+        **Onde:** Arquivo `forge/jobs/backfill_historical.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Job de Backfill Histórico
+        Reprocessa dados históricos sem duplicar com fluxo ao vivo.
+        Usa tabela de staging para evitar conflitos.
+        """
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, from_json, to_timestamp, window, current_timestamp, lit, row_number
+        )
+        from pyspark.sql.window import Window
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, MapType
+        import logging
+        from datetime import datetime, timedelta
+        import argparse
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        # Configuração
+        RELAY_BROKER = "<relay-broker>"
+        RELAY_TOPIC = "forge-events-raw"
+        CONSUMER_GROUP_BACKFILL = "forge-backfill-v1"
+
+        # Schema do evento
+        EVENT_SCHEMA = StructType([
+            StructField("event_id", StringType(), False),
+            StructField("tenant_id", StringType(), False),
+            StructField("timestamp", LongType(), False),
+            StructField("service_id", StringType(), False),
+            StructField("metric_name", StringType(), False),
+            StructField("metric_value", DoubleType(), False),
+            StructField("tags", MapType(StringType(), StringType()), True),
+        ])
+
+        class BackfillJob:
+            """Job de backfill histórico"""
+            
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            def backfill_date_range(self, start_date, end_date, table_name="aggregated"):
+                """
+                Backfill de um intervalo de datas.
+                
+                Args:
+                    start_date: Data inicial (YYYY-MM-DD)
+                    end_date: Data final (YYYY-MM-DD)
+                    table_name: Nome da tabela para backfill
+                """
+                self.logger.info(f"Backfill: start_date={start_date}, end_date={end_date}, table={table_name}")
+                
+                # Converter datas para timestamps
+                start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
+                end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp() * 1000) + 86400000  # +1 dia
+                
+                # Ler do Relay
+                df = self.spark.readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("subscribe", RELAY_TOPIC) \
+                    .option("kafka.group.id", CONSUMER_GROUP_BACKFILL) \
+                    .option("startingOffsets", "earliest") \
+                    .load()
+                
+                # Desserializar
+                df_parsed = df.select(
+                    col("key").cast(StringType()).alias("partition_key"),
+                    from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                    col("timestamp").alias("kafka_timestamp")
+                ).select(
+                    col("partition_key"),
+                    col("event.*"),
+                    col("kafka_timestamp")
+                )
+                
+                # Filtrar por intervalo de datas
+                df_filtered = df_parsed.filter(
+                    (col("timestamp") >= start_ts) & (col("timestamp") < end_ts)
+                )
+                
+                # Agregar
+                df_aggregated = df_filtered.groupBy(
+                    window(col("timestamp"), "30 seconds"),
+                    col("tenant_id"),
+                    col("service_id")
+                ).agg(
+                    col("window.start").alias("window_start"),
+                    col("window.end").alias("window_end"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    count("*").alias("event_count"),
+                    sum("metric_value").alias("total_value")
+                )
+                
+                # Adicionar metadados de backfill
+                df_with_metadata = df_aggregated.withColumn("backfill_timestamp", current_timestamp()) \
+                    .withColumn("backfill_start_date", lit(start_date)) \
+                    .withColumn("backfill_end_date", lit(end_date))
+                
+                # Escrever em tabela de staging
+                staging_table = f"{table_name}_backfill_staging"
+                df_with_metadata.write.mode("append") \
+                    .parquet(f"/data/forge/{staging_table}")
+                
+                self.logger.info(f"Backfill escrito em staging: {staging_table}")
+                
+                # Merge com tabela principal (após validação)
+                self.merge_backfill_to_main(staging_table, table_name)
+            
+            def merge_backfill_to_main(self, staging_table, main_table):
+                """
+                Merge de backfill com tabela principal.
+                Deduplicar por chave natural e manter última linha.
+                
+                Args:
+                    staging_table: Tabela de staging
+                    main_table: Tabela principal
+                """
+                self.logger.info(f"Merge: {staging_table} → {main_table}")
+                
+                # Ler staging
+                df_staging = self.spark.read.parquet(f"/data/forge/{staging_table}")
+                
+                # Ler principal
+                try:
+                    df_main = self.spark.read.parquet(f"/data/forge/{main_table}")
+                except:
+                    # Se principal não existe, criar
+                    df_main = self.spark.createDataFrame([], df_staging.schema)
+                
+                # Union
+                df_merged = df_main.union(df_staging)
+                
+                # Deduplicar por chave natural (manter última linha)
+                key_cols = ["window_start", "window_end", "tenant_id", "service_id"]
+                window_spec = Window.partitionBy(*key_cols).orderBy(col("backfill_timestamp").desc())
+                df_with_rn = df_merged.withColumn("rn", row_number().over(window_spec))
+                df_final = df_with_rn.filter(col("rn") == 1).drop("rn")
+                
+                # Escrever principal
+                df_final.write.mode("overwrite") \
+                    .parquet(f"/data/forge/{main_table}")
+                
+                # Limpar staging
+                self.spark.sql(f"DELETE FROM parquet.`/data/forge/{staging_table}`")
+                
+                self.logger.info(f"Merge concluído: {df_final.count()} linhas em {main_table}")
+            
+            def validate_backfill(self, start_date, end_date, table_name="aggregated"):
+                """
+                Validar backfill comparando com batch.
+                
+                Args:
+                    start_date: Data inicial (YYYY-MM-DD)
+                    end_date: Data final (YYYY-MM-DD)
+                    table_name: Nome da tabela
+                """
+                self.logger.info(f"Validando backfill: {start_date} a {end_date}")
+                
+                # Ler dados de backfill
+                df_backfill = self.spark.read.parquet(f"/data/forge/{table_name}_backfill_staging")
+                df_backfill_filtered = df_backfill.filter(
+                    (col("backfill_start_date") == start_date) & (col("backfill_end_date") == end_date)
+                )
+                
+                # Ler dados de batch (se existir)
+                try:
+                    df_batch = self.spark.read.parquet(f"/data/forge/{table_name}_batch")
+                    df_batch_filtered = df_batch.filter(
+                        (col("window_start") >= start_date) & (col("window_start") < end_date)
+                    )
+                except:
+                    self.logger.warning("Dados de batch não encontrados, pulando validação")
+                    return True
+                
+                # Comparar contagem
+                count_backfill = df_backfill_filtered.count()
+                count_batch = df_batch_filtered.count()
+                
+                if count_backfill != count_batch:
+                    self.logger.error(f"Contagem diferente: backfill={count_backfill}, batch={count_batch}")
+                    return False
+                
+                # Comparar valores
+                df_diff = df_backfill_filtered.exceptAll(df_batch_filtered)
+                if df_diff.count() > 0:
+                    self.logger.error(f"Dados diferentes: {df_diff.count()} linhas")
+                    return False
+                
+                self.logger.info("✅ Validação passou")
+                return True
+
+        def main():
+            """Função principal"""
+            parser = argparse.ArgumentParser(description="Backfill histórico do Forge")
+            parser.add_argument("--start-date", required=True, help="Data inicial (YYYY-MM-DD)")
+            parser.add_argument("--end-date", required=True, help="Data final (YYYY-MM-DD)")
+            parser.add_argument("--table", default="aggregated", help="Tabela para backfill")
+            parser.add_argument("--validate", action="store_true", help="Validar backfill")
+            
+            args = parser.parse_args()
+            
+            spark = SparkSession.builder \
+                .appName("forge-backfill") \
+                .getOrCreate()
+            
+            backfill = BackfillJob(spark)
+            
+            # Executar backfill
+            backfill.backfill_date_range(args.start_date, args.end_date, args.table)
+            
+            # Validar (se especificado)
+            if args.validate:
+                backfill.validate_backfill(args.start_date, args.end_date, args.table)
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Exemplos de Uso:**
+
+        ```bash
+        # Backfill de 7 dias
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/backfill_historical.py \
+        --start-date "2024-01-08" \
+        --end-date "2024-01-15" \
+        --table aggregated \
+        --validate
+
+        # Backfill com validação
+        spark-submit \
+        --master local[4] \
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+        forge/jobs/backfill_historical.py \
+        --start-date "2024-01-01" \
+        --end-date "2024-01-08" \
+        --table aggregated \
+        --validate
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Verificar que backfill foi executado
+        ls -la /data/forge/aggregated_backfill_staging/
+        # Esperado: diretório contém arquivos Parquet com dados históricos
+
+        # Validar que dados foram mergeados
+        spark-sql -e "SELECT COUNT(*) FROM parquet.`/data/forge/aggregated` WHERE backfill_timestamp IS NOT NULL"
+        # Esperado: número de linhas > 0
+        ```
+
+        ---
+
+        ## 5. Crie runbook de plantão para 5 modos de falha mais prováveis
+
+        **Ação:** Criar runbook com sintoma → diagnóstico → ação para os 5 modos de falha mais prováveis.
+
+        **Onde:** Arquivo `forge/docs/oncall-runbook.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Runbook de Plantão — Forge Streaming
+
+        ## Modo de Falha 1: Taxa de Consumo Baixa (< 100 evt/s)
+
+        ### Sintoma
+        - Alerta: `ForgeRelayConsumptionRateLow` (taxa < 100 evt/s por 10 min)
+        - Dashboard: Consumer lag está crescendo
+        - Latência p95 > 120 s
+
+        ### Diagnóstico
+
+        **Passo 1: Verificar status do job de streaming**
+        ```bash
+        # Verificar se job está rodando
+        kubectl get deployment forge-streaming-ingest -n forge
+        # Esperado: 1 réplica READY
+
+        # Verificar logs
+        kubectl logs -f deployment/forge-streaming-ingest -n forge | tail -100
+        # Procurar por: ERROR, WARN, timeout, exception
+        ```
+
+        **Passo 2: Verificar consumer lag**
+        ```bash
+        # Verificar lag do consumer group
+        kafka-consumer-groups --bootstrap-server <relay-broker> \
+        --group forge-streaming-v1 \
+        --describe
+        # Esperado: LAG < 100k eventos
+
+        # Se LAG > 100k: consumer está atrasado
+        ```
+
+        **Passo 3: Verificar recursos do cluster**
+        ```bash
+        # Verificar CPU/memória dos pods
+        kubectl top pod -n forge | grep forge-streaming
+        # Esperado: CPU < 80%, memória < 80%
+
+        # Se CPU/memória > 80%: aumentar recursos
+        ```
+
+        **Passo 4: Verificar taxa de erro**
+        ```bash
+        # Verificar métrica de erro
+        curl -s http://prometheus:9090/api/v1/query?query=rate(forge_errors_total[5m]) | jq
+        # Esperado: taxa de erro < 1%
+
+        # Se taxa de erro > 1%: investigar tipo de erro
+        ```
+
+        ### Ação
+
+        **Se job não está rodando:**
+        ```bash
+        # Reiniciar job
+        kubectl rollout restart deployment/forge-streaming-ingest -n forge
+
+        # Aguardar 2 min
+        sleep 120
+
+        # Verificar se lag está diminuindo
+        kafka-consumer-groups --bootstrap-server <relay-broker> \
+        --group forge-streaming-v1 \
+        --describe
+        ```
+
+        **Se CPU/memória está alta:**
+        ```bash
+        # Aumentar recursos
+        kubectl set resources deployment forge-streaming-ingest -n forge \
+        --limits=cpu=4,memory=8Gi \
+        --requests=cpu=2,memory=4Gi
+
+        # Aguardar 5 min
+        sleep 300
+
+        # Verificar se taxa de consumo aumentou
+        ```
+
+        **Se taxa de erro está alta:**
+        ```bash
+        # Verificar tipo de erro
+        curl -s http://prometheus:9090/api/v1/query?query=forge_errors_by_type | jq
+
+        # Se erro é "TRANSIENT_ERROR": aguardar recuperação
+        # Se erro é "INVALID_EVENT": investigar origem dos dados
+        # Se erro é "DEPLOY_ERROR": fazer rollback (ver seção Y)
+        ```
+
+        **Se nada funciona:**
+        ```bash
+        # Fazer rollback para batch
+        kubectl delete deployment forge-streaming-ingest -n forge
+        airflow dags trigger forge-batch-ingest
+
+        # Aguardar 5 min
+        sleep 300
+
+        # Verificar se dados estão chegando no DW
+        ```
+
+        ---
+
+        ## Modo de Falha 2: Muitos Eventos Inválidos (> 100 evt/min)
+
+        ### Sintoma
+        - Alerta: `ForgeInvalidEventsHigh` (taxa > 100 eventos/min)
+        - Dashboard: Métrica `forge_invalid_events_total` está crescendo
+        - DLQ `forge-events-invalid` tem muitos eventos
+
+        ### Diagnóstico
+
+        **Passo 1: Inspecionar DLQ**
+        ```bash
+        # Ler eventos da DLQ
+        kafka-console-consumer --bootstrap-server <relay-broker> \
+        --topic forge-events-invalid \
+        --max-messages 10 \
+        --from-beginning | jq
+
+        # Procurar por padrão de erro (ex: campo ausente, tipo incorreto)
+        ```
+
+        **Passo 2: Verificar schema**
+        ```bash
+        # Verificar versão atual do schema
+        curl -s http://<schema-registry>:8081/subjects/forge-events-raw-value/versions/latest | jq
+
+        # Comparar com versão anterior
+        curl -s http://<schema-registry>:8081/subjects/forge-events-raw-value/versions | jq
+        ```
+
+        **Passo 3: Verificar origem dos dados**
+        ```bash
+        # Verificar qual tenant está enviando dados inválidos
+        kafka-console-consumer --bootstrap-server <relay-broker> \
+        --topic forge-events-invalid \
+        --max-messages 100 \
+        --from-beginning | jq '.tenant_id' | sort | uniq -c | sort -rn
+
+        # Procurar por tenant com muitos erros
+        ```
+
+        ### Ação
+
+        **Se schema mudou:**
+        ```bash
+        # Verificar compatibilidade
+        curl -s http://<schema-registry>:8081/config/forge-events-raw-value | jq '.compatibilityLevel'
+        # Esperado: BACKWARD
+
+        # Se compatibilidade é BACKWARD: novo schema é compatível
+        # Se compatibilidade é NONE: novo schema pode quebrar consumidores
+
+        # Coordenar com time de Relay para validar schema
+        ```
+
+        **Se tenant está enviando dados ruins:**
+        ```bash
+        # Contatar tenant para corrigir dados
+        # Ou filtrar tenant temporariamente
+
+        # Reprocessar DLQ após correção
+        spark-submit \
+        --master local[4] \
+        forge/jobs/replay_events.py \
+        --mode dlq \
+        --dlq-topic forge-events-invalid \
+        --limit 10000
+        ```
+
+        **Se problema persiste:**
+        ```bash
+        # Aumentar retenção de DLQ para investigação
+        kafka-configs --bootstrap-server <relay-broker> \
+        --entity-type topics \
+        --entity-name forge-events-invalid \
+        --alter \
+        --add-config retention.ms=604800000  # 7 dias
+
+        # Alertar time de dados para investigar origem
+        ```
+
+        ---
+
+        ## Modo de Falha 3: Offset Commit Falhando
+
+        ### Sintoma
+        - Alerta: `ForgeRelayOffsetCommitFailure` (taxa de commit = 0)
+        - Dashboard: Consumer lag está crescendo (offsets não estão sendo commitados)
+        - Logs: "Failed to commit offsets"
+
+        ### Diagnóstico
+
+        **Passo 1: Verificar status do Relay**
+        ```bash
+        # Verificar saúde do Relay
+        curl -s http://<relay-broker>:9092/health | jq
+
+        # Verificar se brokers estão online
+        kafka-broker-api-versions --bootstrap-server <relay-broker>
+        ```
+
+        **Passo 2: Verificar consumer group**
+        ```bash
+        # Verificar status do consumer group
+        kafka-consumer-groups --bootstrap-server <relay-broker> \
+        --group forge-streaming-v1 \
+        --describe
+
+        # Procurar por: STABLE (ok) ou REBALANCING (problema)
+        ```
+
+        **Passo 3: Verificar logs do job**
+        ```bash
+        # Verificar logs de erro
+        kubectl logs -f deployment/forge-streaming-ingest -n forge | grep -i "commit\|offset"
+
+        # Procurar por: "Failed to commit", "Offset out of range", "Group coordinator not available"
+        ```
+
+        ### Ação
+
+        **Se Relay está offline:**
+        ```bash
+        # Aguardar recuperação do Relay
+        # Monitorar status
+        watch -n 5 'kafka-broker-api-versions --bootstrap-server <relay-broker>'
+
+        # Após recuperação, job retoma automaticamente
+        ```
+
+        **Se consumer group está em REBALANCING:**
+        ```bash
+        # Aguardar rebalance completar (máximo 5 min)
+        sleep 300
+
+        # Verificar se offsets estão sendo commitados
+        kafka-consumer-groups --bootstrap-server <relay-broker> \
+        --group forge-streaming-v1 \
+        --describe
+        ```
+
+        **Se problema persiste:**
+        ```bash
+        # Resetar consumer group (CUIDADO: vai reprocessar dados)
+        kafka-consumer-groups --bootstrap-server <relay-broker> \
+        --group forge-streaming-v1 \
+        --reset-offsets \
+        --to-latest \
+        --execute
+
+        # Reiniciar job
+        kubectl rollout restart deployment/forge-streaming-ingest -n forge
+        ```
+
+        ---
+
+        ## Modo de Falha 4: Latência p95 > 120 s
+
+        ### Sintoma
+        - Alerta: `ForgeLatencyHigh` (p95 > 120 s)
+        - Dashboard: Watermark está atrasado
+        - Consumidores (Sentinel, Cerebro) reclamam de dados lentos
+
+        ### Diagnóstico
+
+        **Passo 1: Verificar taxa de consumo**
+        ```bash
+        # Verificar se taxa de consumo está baixa
+        curl -s http://prometheus:9090/api/v1/query?query=rate(forge_events_consumed_total[5m]) | jq
+
+        # Esperado: > 1000 eventos/s
+        # Se < 1000 eventos/s: problema é consumo lento (ver Modo 1)
+        ```
+
+        **Passo 2: Verificar tempo de processamento**
+        ```bash
+        # Verificar tempo de processamento por etapa
+        curl -s http://prometheus:9090/api/v1/query?query=forge_processing_time_seconds | jq
+
+        # Procurar por etapa com tempo alto
+        ```
+
+        **Passo 3: Verificar tamanho de buffer**
+        ```bash
+        # Verificar tamanho de buffer em memória
+        curl -s http://prometheus:9090/api/v1/query?query=forge_buffer_size_events | jq
+
+        # Esperado: < 100k eventos
+        # Se > 100k eventos: buffer está crescendo (problema de consumo)
+        ```
+
+        ### Ação
+
+        **Se taxa de consumo está baixa:**
+        ```bash
+        # Ver Modo 1: Taxa de Consumo Baixa
+        ```
+
+        **Se tempo de processamento está alto:**
+        ```bash
+        # Identificar etapa lenta
+        # Exemplo: se transformação está lenta
+
+        # Aumentar paralelismo
+        kubectl set env deployment/forge-streaming-ingest -n forge \
+        SPARK_EXECUTOR_CORES=4 \
+        SPARK_EXECUTOR_MEMORY=8g
+
+        # Aguardar 5 min
+        sleep 300
+
+        # Verificar se latência diminuiu
+        ```
+
+        **Se buffer está crescendo:**
+        ```bash
+        # Aumentar taxa de escrita
+        # Aumentar frequência de trigger (ex: 15 s em vez de 30 s)
+
+        # Ou aumentar paralelismo (ver acima)
+        ```
+
+        ---
+
+        ## Modo de Falha 5: Dados Duplicados no DW
+
+        ### Sintoma
+        - Alerta: `ForgeDuplicateEventsDetected` (contagem de eventos > esperado)
+        - Dashboard: Métrica `forge_duplicate_events_total` está crescendo
+        - Queries retornam valores maiores que esperado
+
+        ### Diagnóstico
+
+        **Passo 1: Verificar se há reprocessamento**
+        ```bash
+        # Verificar se há eventos com mesmo event_id
+        spark-sql -e "
+        SELECT event_id, COUNT(*) as count
+        FROM parquet.`/data/forge/aggregated`
+        GROUP BY event_id
+        HAVING count > 1
+        LIMIT 10
+        "
+
+        # Se houver duplicatas: problema é reprocessamento
+        ```
+
+        **Passo 2: Verificar se há falha de deduplicação**
+        ```bash
+        # Verificar se deduplicação está funcionando
+        spark-sql -e "
+        SELECT COUNT(DISTINCT event_id) as unique_events,
+              COUNT(*) as total_events
+        FROM parquet.`/data/forge/aggregated`
+        "
+
+        # Se unique_events < total_events: há duplicatas
+        ```
+
+        **Passo 3: Verificar logs de escrita**
+        ```bash
+        # Verificar logs de escrita
+        kubectl logs -f deployment/forge-streaming-write -n forge | grep -i "duplicate\|merge\|dedup"
+
+        # Procurar por: "Deduplication failed", "Merge error"
+        ```
+
+        ### Ação
+
+        **Se há reprocessamento:**
+        ```bash
+        # Verificar se há replay em andamento
+        ps aux | grep replay_events.py
+
+        # Se há replay: aguardar conclusão
+        # Depois, validar que dados não foram duplicados
+
+        # Se replay criou duplicatas: limpar dados
+        spark-sql -e "
+        DELETE FROM parquet.`/data/forge/aggregated`
+        WHERE backfill_timestamp > '2024-01-15 10:00:00'
+        "
+        ```
+
+        **Se deduplicação falhou:**
+        ```bash
+        # Verificar código de deduplicação
+        grep -n "dropDuplicates\|MERGE" forge/jobs/streaming_write.py
+
+        # Se lógica está errada: fazer fix e redeploy
+        # Depois, limpar dados duplicados
+
+        spark-sql -e "
+        DELETE FROM parquet.`/data/forge/aggregated`
+        WHERE ingestion_timestamp > '2024-01-15 10:00:00'
+        "
+
+        # Reprocessar dados
+        spark-submit \
+        --master local[4] \
+        forge/jobs/replay_events.py \
+        --mode timestamp \
+        --start-timestamp "2024-01-15T10:00:00Z" \
+        --end-timestamp "2024-01-15T11:00:00Z"
+        ```
+
+        **Se problema persiste:**
+        ```bash
+        # Fazer rollback para batch
+        kubectl delete deployment forge-streaming-ingest -n forge
+        airflow dags trigger forge-batch-ingest
+
+        # Limpar dados duplicados
+        spark-sql -e "
+        DELETE FROM parquet.`/data/forge/aggregated`
+        WHERE ingestion_timestamp > '2024-01-15 10:00:00'
+        "
+
+        # Reprocessar com batch
+        ```
+
+        ---
+
+        ## Escalação
+
+        Se nenhuma ação acima resolver o problema:
+
+        1. **Contatar time de Relay** (se problema é com Relay)
+          - Slack: #relay-oncall
+          - PagerDuty: Relay On-Call
+
+        2. **Contatar time de Infraestrutura** (se problema é com cluster Spark)
+          - Slack: #infra-oncall
+          - PagerDuty: Infra On-Call
+
+        3. **Contatar time de Dados** (se problema é com dados)
+          - Slack: #data-oncall
+          - PagerDuty: Data On-Call
+
+        4. **Fazer rollback para batch** (último recurso)
+          - Ver seção Y: Rollback
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que runbook está documentado
+        grep -E "Modo de Falha|Sintoma|Diagnóstico|Ação" forge/docs/oncall-runbook.md | wc -l
+        # Esperado: > 50 linhas
+        ```
+
+        ---
+
+        ## 6. Crie alertas para detecção de falhas
+
+        **Ação:** Implementar alertas em Prometheus para os 5 modos de falha.
+
+        **Onde:** Arquivo `forge/monitoring/failure-detection-alerts.yaml` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```yaml
+        # forge/monitoring/failure-detection-alerts.yaml
+        apiVersion: monitoring.coreos.com/v1
+        kind: PrometheusRule
+        metadata:
+          name: forge-failure-detection
+          namespace: forge
+        spec:
+          groups:
+          - name: forge.failure.detection
+            interval: 30s
+            rules:
+            # ========== Modo 1: Taxa de Consumo Baixa ==========
+            - alert: ForgeConsumptionRateLow
+              expr: |
+                rate(kafka_consumergroup_lag{group="forge-streaming-v1"}[5m]) < 100
+              for: 10m
+              labels:
+                severity: warning
+                mode: "1"
+              annotations:
+                summary: "Forge: Taxa de consumo baixa (< 100 evt/s)"
+                description: "Taxa de consumo está {{ $value | humanize }} eventos/s"
+                runbook: "forge/docs/oncall-runbook.md#modo-de-falha-1"
+            
+            # ========== Modo 2: Muitos Eventos Inválidos ==========
+            - alert: ForgeInvalidEventsHigh
+              expr: |
+                rate(forge_invalid_events_total[5m]) > 100 / 60
+              for: 5m
+              labels:
+                severity: warning
+                mode: "2"
+              annotations:
+                summary: "Forge: Taxa alta de eventos inválidos (> 100/min)"
+                description: "Taxa de eventos inválidos: {{ $value | humanize }} eventos/s"
+                runbook: "forge/docs/oncall-runbook.md#modo-de-falha-2"
+            
+            # ========== Modo 3: Offset Commit Falhando ==========
+            - alert: ForgeOffsetCommitFailure
+              expr: |
+                rate(kafka_consumergroup_commit_latency_total{group="forge-streaming-v1"}[5m]) == 0
+              for: 5m
+              labels:
+                severity: critical
+                mode: "3"
+              annotations:
+                summary: "Forge: Offset commit falhando"
+                description: "Consumer group não consegue fazer commit de offsets"
+                runbook: "forge/docs/oncall-runbook.md#modo-de-falha-3"
+            
+            # ========== Modo 4: Latência Alta ==========
+            - alert: ForgeLatencyHigh
+              expr: |
+                histogram_quantile(0.95, rate(forge_latency_seconds_bucket[5m])) > 120
+              for: 5m
+              labels:
+                severity: warning
+                mode: "4"
+              annotations:
+                summary: "Forge: Latência p95 alta (> 120 s)"
+                description: "Latência p95: {{ $value | humanize }}s"
+                runbook: "forge/docs/oncall-runbook.md#modo-de-falha-4"
+            
+            # ========== Modo 5: Dados Duplicados ==========
+            - alert: ForgeDuplicateEventsDetected
+              expr: |
+                rate(forge_duplicate_events_total[5m]) > 10
+              for: 5m
+              labels:
+                severity: warning
+                mode: "5"
+              annotations:
+                summary: "Forge: Eventos duplicados detectados"
+                description: "Taxa de eventos duplicados: {{ $value | humanize }} eventos/s"
+                runbook: "forge/docs/oncall-runbook.md#modo-de-falha-5"
+            
+            # ========== Alertas Adicionais ==========
+            - alert: ForgeDeployError
+              expr: |
+                rate(forge_deploy_errors_total[5m]) > 0
+              for: 1m
+              labels:
+                severity: critical
+                mode: "deploy"
+              annotations:
+                summary: "Forge: Erro de deploy detectado"
+                description: "Taxa de erro de deploy: {{ $value | humanize }} erros/s"
+                runbook: "forge/docs/oncall-runbook.md"
+            
+            - alert: ForgeDependencyError
+              expr: |
+                rate(forge_dependency_errors_total[5m]) > 0
+              for: 5m
+              labels:
+                severity: critical
+                mode: "dependency"
+              annotations:
+                summary: "Forge: Erro de dependência detectado"
+                description: "Taxa de erro de dependência: {{ $value | humanize }} erros/s"
+                runbook: "forge/docs/oncall-runbook.md"
+            
+            - alert: ForgeTransientErrorRetryExhausted
+              expr: |
+                rate(forge_transient_errors_total[5m]) > 10
+              for: 5m
+              labels:
+                severity: warning
+                mode: "transient"
+              annotations:
+                summary: "Forge: Muitos erros transitórios (retry exhausted)"
+                description: "Taxa de erro transitório: {{ $value | humanize }} erros/s"
+                runbook: "forge/docs/oncall-runbook.md"
+            
+            - alert: ForgeConsumerLagHigh
+              expr: |
+                kafka_consumergroup_lag{group="forge-streaming-v1"} > 100000
+              for: 5m
+              labels:
+                severity: warning
+                mode: "lag"
+              annotations:
+                summary: "Forge: Consumer lag alto (> 100k eventos)"
+                description: "Consumer lag: {{ $value | humanize }} eventos"
+                runbook: "forge/docs/oncall-runbook.md"
+            
+            - alert: ForgeWatermarkLate
+              expr: |
+                (time() * 1000 - forge_watermark_timestamp_ms) > 120000
+              for: 5m
+              labels:
+                severity: warning
+                mode: "watermark"
+              annotations:
+                summary: "Forge: Watermark atrasado (> 120 s)"
+                description: "Watermark está {{ $value | humanize }}ms atrás"
+                runbook: "forge/docs/oncall-runbook.md"
+            
+            - alert: ForgeCheckpointFailure
+              expr: |
+                rate(forge_checkpoint_failures_total[5m]) > 0
+              for: 5m
+              labels:
+                severity: critical
+                mode: "checkpoint"
+              annotations:
+                summary: "Forge: Checkpoint falhando"
+                description: "Taxa de falha de checkpoint: {{ $value | humanize }} falhas/s"
+                runbook: "forge/docs/oncall-runbook.md"
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Validar regras de alerta
+        kubectl apply -f forge/monitoring/failure-detection-alerts.yaml --dry-run=client
+        # Esperado: validação passa sem erros
+
+        # Deploy em staging
+        kubectl apply -f forge/monitoring/failure-detection-alerts.yaml -n forge-staging
+
+        # Verificar alertas
+        kubectl get prometheusrule -n forge-staging
+        # Esperado: forge-failure-detection está listado
+        ```
+
+        ---
+
+        ## 7. Crie dashboard de monitoramento de falhas
+
+        **Ação:** Criar dashboard Grafana para visualizar falhas e métricas de recuperação.
+
+        **Onde:** Arquivo `forge/monitoring/failure-dashboard.json` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```json
+        {
+          "dashboard": {
+            "title": "Forge Failure Detection & Recovery",
+            "panels": [
+              {
+                "title": "Modo 1: Taxa de Consumo (evt/s)",
+                "targets": [
+                  {
+                    "expr": "rate(kafka_consumergroup_lag{group=\"forge-streaming-v1\"}[5m])"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 100, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Modo 2: Taxa de Eventos Inválidos (evt/min)",
+                "targets": [
+                  {
+                    "expr": "rate(forge_invalid_events_total[5m]) * 60"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 100, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Modo 3: Taxa de Offset Commit (commits/min)",
+                "targets": [
+                  {
+                    "expr": "rate(kafka_consumergroup_commit_latency_total{group=\"forge-streaming-v1\"}[5m]) * 60"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 0, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Modo 4: Latência p95 (segundos)",
+                "targets": [
+                  {
+                    "expr": "histogram_quantile(0.95, rate(forge_latency_seconds_bucket[5m]))"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 120, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Modo 5: Taxa de Eventos Duplicados (evt/s)",
+                "targets": [
+                  {
+                    "expr": "rate(forge_duplicate_events_total[5m])"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 10, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Consumer Lag (eventos)",
+                "targets": [
+                  {
+                    "expr": "kafka_consumergroup_lag{group=\"forge-streaming-v1\"}"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 100000, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Taxa de Erro por Tipo",
+                "targets": [
+                  {
+                    "expr": "rate(forge_errors_by_type[5m])"
+                  }
+                ]
+              },
+              {
+                "title": "Watermark Latency (segundos)",
+                "targets": [
+                  {
+                    "expr": "(time() * 1000 - forge_watermark_timestamp_ms) / 1000"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 120, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "Checkpoint Success Rate (%)",
+                "targets": [
+                  {
+                    "expr": "rate(forge_checkpoint_successes_total[5m]) / (rate(forge_checkpoint_successes_total[5m]) + rate(forge_checkpoint_failures_total[5m])) * 100"
+                  }
+                ],
+                "thresholds": [
+                  {"value": 95, "color": "red", "label": "Crítico"}
+                ]
+              },
+              {
+                "title": "DLQ Events by Topic",
+                "targets": [
+                  {
+                    "expr": "kafka_topic_partition_current_offset{topic=~\"forge-events-.*\"}"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Importar dashboard no Grafana
+        curl -X POST http://grafana:3000/api/dashboards/db \
+          -H "Content-Type: application/json" \
+          -d @forge/monitoring/failure-dashboard.json
+        # Esperado: dashboard é criado com sucesso
+        ```
+
+        ---
+
+        ## X. Ponto de não-retorno
+
+        **Ponto de não-retorno:** Após o passo 6 (deploy de alertas em produção), o sistema começa a monitorar e alertar sobre falhas.
+
+        **Por quê:** Uma vez que alertas estão ativos, desativá-los requer:
+        1. Parar o Prometheus
+        2. Remover regras de alerta
+        3. Perder histórico de alertas
+        4. Possível downtime não detectado
+
+        **Mitigação:** Antes do passo 6, testar alertas em staging (passos 1–5).
+
+        ---
+
+        ## Y. Rollback
+
+        **Procedimento de rollback (se necessário após passo 6):**
+
+        ```bash
+        #!/bin/bash
+        # Script de rollback: desativar monitoramento de falhas
+        set -e
+        echo "=== Rollback: Desativar Monitoramento de Falhas ==="
+
+        # 1. Remover alertas
+        echo "1. Removendo alertas..."
+        kubectl delete prometheusrule forge-failure-detection -n forge
+
+        # 2. Remover dashboard
+        echo "2. Removendo dashboard..."
+        curl -X DELETE http://grafana:3000/api/dashboards/uid/forge-failure-detection
+
+        # 3. Remover tópicos DLQ (opcional, manter para investigação)
+        echo "3. Removendo tópicos DLQ (opcional)..."
+        # kafka-topics --bootstrap-server <relay-broker> --delete --topic forge-events-invalid
+        # kafka-topics --bootstrap-server <relay-broker> --delete --topic forge-events-retry-exhausted
+        # kafka-topics --bootstrap-server <relay-broker> --delete --topic forge-events-business-logic-error
+        # kafka-topics --bootstrap-server <relay-broker> --delete --topic forge-events-unknown-error
+
+        # 4. Remover jobs de replay/backfill
+        echo "4. Removendo jobs de replay/backfill..."
+        rm -f forge/jobs/replay_events.py
+        rm -f forge/jobs/backfill_historical.py
+
+        # 5. Remover código de DLQ
+        echo "5. Removendo código de DLQ..."
+        git revert HEAD~5..HEAD  # Reverter últimos 5 commits
+
+        echo "=== Rollback concluído ==="
+        ```
+
+        ---
+
+        ## Z. Critérios de conclusão
+
+        - [ ] **Classificação de falhas:** 5 tipos definidos com critérios de detecção e resposta (passo 1)
+        - [ ] **Tópicos DLQ:** Criados no Relay com retenção de 30 dias (passo 2)
+        - [ ] **Código de retry:** Implementado com backoff exponencial (passo 2)
+        - [ ] **Job de replay:** Implementado com suporte a offset, timestamp, DLQ (passo 3)
+        - [ ] **Job de backfill:** Implementado com validação de equivalência (passo 4)
+        - [ ] **Runbook de plantão:** Documentado para 5 modos de falha (passo 5)
+        - [ ] **Alertas:** Implementados em Prometheus para detecção de falhas (passo 6)
+        - [ ] **Dashboard:** Criado em Grafana para visualização de falhas (passo 7)
+        - [ ] **Testes:** Testes de falha e recuperação implementados
+        - [ ] **Documentação:** Todos os arquivos criados e verificados
+        - [ ] **Suposições:** Todas marcadas com `[SUPOSIÇÃO]` e justificadas
+        - [ ] **Dados faltantes:** Lista de confirmações necessárias documentada
+
+        ---
+
+        ## W. Riscos e mitigação
+
+        | Risco | Probabilidade | Impacto | Mitigação |
+        |-------|---------------|--------|-----------|
+        | Classificação de falha incorreta (falso positivo) | Média | Médio | Testar com dados reais; ajustar critérios |
+        | DLQ fica cheio (muitos eventos inválidos) | Média | Médio | Monitorar tamanho de DLQ; alertar se > 1M eventos |
+        | Replay cria duplicatas (reprocessamento sem dedup) | Média | Alto | Implementar deduplicação; validar com testes |
+        | Backfill é muito lento (reprocessar 90 dias) | Média | Médio | Paralelizar backfill; usar múltiplos jobs |
+        | Runbook é incompleto (ação não resolve problema) | Média | Médio | Testar runbook com falhas simuladas; atualizar |
+        | Alertas geram muitos falsos positivos | Alta | Médio | Ajustar thresholds; usar múltiplas condições |
+        | Alertas não disparam (falha não é detectada) | Baixa | Alto | Testar alertas com falhas simuladas; validar |
+        | Rollback é muito lento (downtime prolongado) | Baixa | Alto | Testar rollback em staging; documentar passos |
+        | Dados históricos são perdidos (backfill falha) | Baixa | Alto | Manter backup de dados; validar backfill |
+        | On-call não consegue seguir runbook (falta contexto) | Média | Médio | Documentar bem; treinar on-call; ter contatos |
+
+        ---
+
+        ## Dados faltantes e confirmações necessárias
+
+        ### Dados que faltam:
+
+        1. **Taxa real de eventos inválidos:** Qual é a taxa esperada de eventos inválidos? (Necessário para threshold de alerta)
+        2. **Taxa real de erro transitório:** Qual é a taxa esperada de erros transitórios? (Necessário para threshold de retry)
+        3. **Tempo de recuperação esperado:** Quanto tempo leva para Relay/DW recuperar? (Necessário para timeout de wait)
+        4. **Tamanho máximo de DLQ:** Qual é o tamanho máximo aceitável de DLQ? (Necessário para alerta)
+        5. **Frequência de backfill:** Com que frequência backfill será executado? (Necessário para agendamento)
+        6. **Retenção de DLQ:** Quanto tempo manter eventos em DLQ? (Necessário para configuração)
+        7. **Contatos de on-call:** Quem é responsável por cada tipo de falha? (Necessário para escalação)
+        8. **SLA de resolução:** Qual é o SLA para resolver cada tipo de falha? (Necessário para alerta)
+
+        ### Confirmações que derrubariam/validariam escolhas futuras:
+
+        - Se **taxa de eventos inválidos > 1000/min**, aumentar threshold de alerta
+        - Se **tempo de recuperação > 10 min**, aumentar timeout de wait
+        - Se **tamanho de DLQ > 10M eventos**, aumentar retenção ou limpar mais frequentemente
+        - Se **backfill é muito lento**, paralelizar ou usar batch
+        - Se **runbook não resolve problema**, adicionar mais passos de diagnóstico
+        - Se **alertas geram muitos falsos positivos**, ajustar thresholds ou usar múltiplas condições
+        - Se **on-call não consegue seguir runbook**, simplificar ou adicionar mais contexto
+
+        ---
+
+        ## Suposições marcadas
+
+        | # | Suposição | Razão | Confirmação necessária |
+        |---|-----------|-------|------------------------|
+        | [SUPOSIÇÃO-1] | 5 tipos de falha cobrem 80% dos casos | Baseado em experiência com streaming | Validar com dados reais de falhas |
+        | [SUPOSIÇÃO-2] | Retry com backoff exponencial é suficiente | Padrão em sistemas distribuídos | Testar com falhas transitórias reais |
+        | [SUPOSIÇÃO-3] | Retenção de DLQ é 30 dias | Típico para investigação de falhas | Confirmar política de retenção |
+        | [SUPOSIÇÃO-4] | Timeout de wait para dependência é 5 min | Trade-off entre latência e confiabilidade | Ajustar baseado em SLA |
+        | [SUPOSIÇÃO-5] | Threshold de alerta para consumo baixo é 100 evt/s | Baseado em volume esperado | Validar com dados reais |
+        | [SUPOSIÇÃO-6] | Threshold de alerta para eventos inválidos é 100/min | Baseado em taxa esperada | Validar com dados reais |
+        | [SUPOSIÇÃO-7] | Threshold de alerta para latência é 120 s | Baseado em SLO de Etapa 2 | Confirmar SLO |
+        | [SUPOSIÇÃO-8] | Runbook cobre 5 modos de falha mais prováveis | Baseado em experiência | Validar com dados reais de falhas |
+        | [SUPOSIÇÃO-9] | Replay suporta offset, timestamp, DLQ | Necessário para flexibilidade | Testar com dados reais |
+        | [SUPOSIÇÃO-10] | Backfill usa staging+merge para evitar duplicatas | Padrão em data warehousing | Validar com testes de equivalência |
+
+        ---
+
+        ## Próximos passos (Etapa 8)
+
+        Após conclusão desta etapa, a recuperação de falhas alimentará:
+        - **Etapa 8:** Validação de equivalência com dados históricos (streaming vs batch)
+        - **Etapa 9:** Migração gradual com canary, validação de consumidores
+        - **Etapa 10:** Cutover final e monitoramento pós-migração
+        {% endraw %}
+      INSUMO_ETAPA_9: |
+            # Etapa 9 de 10: Dual-Run e Reconciliação (14 dias)
+
+            **Depende de:** Etapas 5, 6 e 8.
+
+            ---
+
+            ## 0. Pré-requisitos
+
+            - [ ] Código de transformação streaming implementado (Etapa 4: `streaming_transform.py`)
+            - [ ] Código de escrita incremental com deduplicação (Etapa 5: `streaming_write.py`)
+            - [ ] Views de compatibilidade criadas (Etapa 6: `views_compatibility.sql`)
+            - [ ] Alertas e instrumentação implementados (Etapa 8: `alerting-rules.yaml`, `streaming_instrumented.py`)
+            - [ ] Acesso ao repositório de código do Forge (`forge/jobs/`, `forge/config/`, `forge/monitoring/`)
+            - [ ] Acesso ao cluster Spark em staging e produção (para rodar batch e streaming em paralelo)
+            - [ ] Acesso ao DW (Parquet em `/data/forge/` ou equivalente SQL) para criar tabelas espelho
+            - [ ] Acesso ao Relay (tópicos, offsets, retenção) para validar que dual-run não degrada
+            - [ ] Acesso a logs de batch (últimos 30 dias) para comparação de baseline
+            - [ ] Acesso a logs de streaming (últimos 7 dias de staging) para comparação
+            - [ ] Resultado da Etapa 2 disponível: SLOs (latência p95 = 120 s, completude ≥ 99.9%, disponibilidade ≥ 99.5%)
+            - [ ] Resultado da Etapa 5 disponível: estratégia de escrita incremental (deduplicação, merge, staging)
+            - [ ] Resultado da Etapa 6 disponível: contrato de leitura para consumidores (lag, views)
+            - [ ] Resultado da Etapa 8 disponível: métricas e alertas (16 métricas mínimas, 12 alertas)
+            - [ ] Ferramentas: editor de código, `spark-submit`, `psql`, `curl`, `jq`, `git`, YAML editor
+            - [ ] Permissão para criar tabelas espelho no DW
+            - [ ] Permissão para criar jobs de reconciliação em Airflow/cron
+            - [ ] Permissão para modificar configuração de Relay (retenção, partições)
+            - [ ] Contato técnico confirmado em Sentinel, Cerebro, Pepper para validar que dual-run não afeta
+            - [ ] Contato técnico confirmado em on-call para validar runbook de divergências
+            - [ ] Política de retenção de dados no DW (ex: 90 dias)
+            - [ ] Custo atual de batch ($/hora) para comparação com dual-run
+            - [ ] Capacidade de armazenamento do DW (GB disponível para tabelas espelho)
+            - [ ] Capacidade de processamento do Relay (eventos/s máximo)
+
+            ---
+
+            ## 1. Defina estratégia de isolamento: tabelas espelho e schema separado
+
+            **Ação:** Criar tabelas espelho para saída do streaming, separadas das tabelas de batch, sem afetar consumidores.
+
+            **Onde:** Arquivo `forge/config/dual-run-isolation-strategy.md` (novo) no repositório do Forge.
+
+            **Procedimento:**
+
+            ```markdown
+            # Estratégia de Isolamento — Dual-Run Batch vs Streaming
+
+            ## Objetivo
+            Rodar batch e streaming em paralelo por 14 dias, sem que streaming afete consumidores.
+            Consumidores continuam lendo de batch. Reconciliação compara batch vs streaming.
+
+            ## Estratégia: Schema Separado + Tabelas Espelho
+
+            ### Estrutura de Diretórios
+
+            ```
+            /data/forge/
+            ├── batch/                          # Saída do batch (atual)
+            │   ├── aggregated/
+            │   ├── by_service/
+            │   ├── by_version/
+            │   ├── percentiles/
+            │   ├── billing_events/
+            │   ├── anomalies/
+            │   ├── sla_violations/
+            │   ├── behavior_changes/
+            │   ├── cerebro/
+            │   ├── error_rates/
+            │   └── enriched/
+            ├── streaming/                      # Saída do streaming (novo)
+            │   ├── aggregated/
+            │   ├── by_service/
+            │   ├── by_version/
+            │   ├── percentiles/
+            │   ├── billing_events/
+            │   ├── anomalies/
+            │   ├── sla_violations/
+            │   ├── behavior_changes/
+            │   ├── cerebro/
+            │   ├── error_rates/
+            │   └── enriched/
+            └── reconciliation/                 # Saída de reconciliação
+                ├── divergences/
+                ├── metrics/
+                └── reports/
+            ```
+
+            ### Isolamento em Nível de Tabela
+
+            #### Opção 1: Diretórios Separados (Recomendado)
+            **Vantagem:** Simples, sem mudanças em schema
+            **Desvantagem:** Consumidores precisam saber qual diretório ler
+
+            ```python
+            # Batch escreve em /data/forge/batch/aggregated
+            df_batch.write.mode("append").parquet("/data/forge/batch/aggregated")
+
+            # Streaming escreve em /data/forge/streaming/aggregated
+            df_streaming.write.mode("append").parquet("/data/forge/streaming/aggregated")
+
+            # Consumidores leem de /data/forge/batch/aggregated (sem mudança)
+            df_consumer = spark.read.parquet("/data/forge/batch/aggregated")
+            ```
+
+            #### Opção 2: Schema Separado (Se usar SQL)
+            **Vantagem:** Isolamento completo em nível de banco de dados
+            **Desvantagem:** Requer mudanças em queries de consumidores
+
+            ```sql
+            -- Batch escreve em schema forge_batch
+            CREATE SCHEMA IF NOT EXISTS forge_batch;
+            CREATE TABLE forge_batch.aggregated AS SELECT ...;
+
+            -- Streaming escreve em schema forge_streaming
+            CREATE SCHEMA IF NOT EXISTS forge_streaming;
+            CREATE TABLE forge_streaming.aggregated AS SELECT ...;
+
+            -- Consumidores leem de forge_batch (sem mudança)
+            SELECT * FROM forge_batch.aggregated;
+            ```
+
+            #### Opção 3: Sufixo de Tabela
+            **Vantagem:** Simples, sem mudanças em estrutura de diretórios
+            **Desvantagem:** Nomes de tabela ficam longos
+
+            ```python
+            # Batch escreve em aggregated_batch
+            df_batch.write.mode("append").parquet("/data/forge/aggregated_batch")
+
+            # Streaming escreve em aggregated_streaming
+            df_streaming.write.mode("append").parquet("/data/forge/aggregated_streaming")
+
+            # Consumidores leem de aggregated_batch (sem mudança)
+            df_consumer = spark.read.parquet("/data/forge/aggregated_batch")
+            ```
+
+            ### Recomendação: Opção 1 (Diretórios Separados)
+
+            **Razão:**
+            - Simples de implementar (sem mudanças em schema)
+            - Fácil de limpar (remover `/data/forge/streaming/` após dual-run)
+            - Consumidores não precisam mudar (continuam lendo `/data/forge/batch/`)
+            - Reconciliação é simples (comparar dois diretórios)
+
+            ### Implementação
+
+            #### Passo 1: Criar Diretórios
+            ```bash
+            # Criar diretórios para streaming
+            mkdir -p /data/forge/streaming/{aggregated,by_service,by_version,percentiles,billing_events,anomalies,sla_violations,behavior_changes,cerebro,error_rates,enriched}
+
+            # Definir permissões
+            chmod 755 /data/forge/streaming
+            chmod 755 /data/forge/streaming/*
+            ```
+
+            #### Passo 2: Modificar Job de Batch
+            ```python
+            # forge/jobs/batch_transform.py (modificado para dual-run)
+            def run_batch_transform():
+                """Executar transformação de batch"""
+                # Ler do Relay
+                df_raw = spark.read.parquet("/data/relay/events")
+                
+                # Transformar
+                df_aggregated = transform(df_raw)
+                
+                # Escrever em /data/forge/batch/ (sem mudança)
+                df_aggregated.write.mode("append").parquet("/data/forge/batch/aggregated")
+                
+                logger.info("Batch escrito em /data/forge/batch/aggregated")
+            ```
+
+            #### Passo 3: Modificar Job de Streaming
+            ```python
+            # forge/jobs/streaming_transform.py (modificado para dual-run)
+            def run_streaming_transform():
+                """Executar transformação de streaming"""
+                # Ler do Relay
+                df_raw = spark.readStream.format("kafka") \
+                    .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                    .option("subscribe", RELAY_TOPIC) \
+                    .load()
+                
+                # Transformar
+                df_aggregated = transform(df_raw)
+                
+                # Escrever em /data/forge/streaming/ (novo)
+                query = df_aggregated.writeStream \
+                    .format("parquet") \
+                    .option("path", "/data/forge/streaming/aggregated") \
+                    .option("checkpointLocation", "/data/forge/checkpoint/streaming/aggregated") \
+                    .outputMode("append") \
+                    .trigger(processingTime="30 seconds") \
+                    .start()
+                
+                logger.info("Streaming escrito em /data/forge/streaming/aggregated")
+                query.awaitTermination()
+            ```
+
+            #### Passo 4: Views Continuam Lendo de Batch
+            ```sql
+            -- forge/sql/views_compatibility.sql (sem mudança)
+            -- Views continuam lendo de /data/forge/batch/
+            CREATE OR REPLACE VIEW forge.aggregated_hourly AS
+            SELECT
+                window_start,
+                window_end,
+                tenant_id,
+                SUM(request_count) AS request_count,
+                ...
+            FROM forge.batch.aggregated  -- Lê de batch, não de streaming
+            WHERE window_end < CURRENT_TIMESTAMP() - INTERVAL '5 minutes'
+            GROUP BY window_start, window_end, tenant_id;
+            ```
+
+            ### Impacto em Consumidores
+
+            | Consumidor | Antes | Depois | Mudança |
+            |-----------|-------|--------|---------|
+            | Sentinel | Lê `/data/forge/batch/aggregated` | Lê `/data/forge/batch/aggregated` | Nenhuma |
+            | Cerebro | Lê `/data/forge/batch/enriched` | Lê `/data/forge/batch/enriched` | Nenhuma |
+            | Pepper | Lê `/data/forge/batch/billing_events` | Lê `/data/forge/batch/billing_events` | Nenhuma |
+
+            **Conclusão:** Consumidores não são afetados. Continuam lendo de batch.
+
+            ### Limpeza Após Dual-Run
+
+            Após 14 dias de dual-run, quando streaming é aprovado para cutover:
+
+            ```bash
+            # Remover diretório de streaming (dados históricos)
+            rm -rf /data/forge/streaming/
+
+            # Remover diretório de reconciliação
+            rm -rf /data/forge/reconciliation/
+
+            # Remover checkpoint de streaming
+            rm -rf /data/forge/checkpoint/streaming/
+            ```
+
+            ### Validação
+
+            - [ ] Diretórios `/data/forge/batch/` e `/data/forge/streaming/` existem
+            - [ ] Batch escreve em `/data/forge/batch/`
+            - [ ] Streaming escreve em `/data/forge/streaming/`
+            - [ ] Consumidores continuam lendo de `/data/forge/batch/`
+            - [ ] Views continuam funcionando sem mudança
+            - [ ] Reconciliação consegue comparar os dois diretórios
+            ```
+
+            **Verificação:**
+
+            ```bash
+            # Confirmar que estratégia está documentada
+            grep -E "Opção|Implementação|Impacto|Limpeza" forge/config/dual-run-isolation-strategy.md | wc -l
+            # Esperado: > 20 linhas
+
+            # Criar diretórios
+            mkdir -p /data/forge/streaming/{aggregated,by_service,by_version,percentiles,billing_events,anomalies,sla_violations,behavior_changes,cerebro,error_rates,enriched}
+            ls -la /data/forge/ | grep streaming
+            # Esperado: diretório streaming existe
+            ```
+
+            ---
+
+            ## 2. Implemente job de reconciliação: comparações, frequência, granularidade
+
+            **Ação:** Criar job que compara batch vs streaming com múltiplas estratégias de comparação.
+
+            **Onde:** Arquivo `forge/jobs/reconciliation_job.py` (novo) no repositório do Forge.
+
+            **Procedimento:**
+
+            ```python
+            #!/usr/bin/env python3
+            """
+            Job de Reconciliação — Dual-Run Batch vs Streaming
+            Compara saídas de batch e streaming com múltiplas estratégias.
+            Executa a cada 1 hora.
+            """
+            from pyspark.sql import SparkSession
+            from pyspark.sql.functions import (
+                col, count, sum as spark_sum, avg, max as spark_max, min as spark_min,
+                abs as spark_abs, when, coalesce, lit, current_timestamp, datediff
+            )
+            from pyspark.sql.window import Window
+            import logging
+            from datetime import datetime, timedelta
+            import json
+            import os
+
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            class ReconciliationJob:
+                """Job de reconciliação batch vs streaming"""
+                
+                def __init__(self, spark):
+                    self.spark = spark
+                    self.logger = logger
+                    self.report = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "comparisons": {},
+                        "divergences": [],
+                        "metrics": {},
+                        "status": "PENDING"
+                    }
+                
+                # ========== Estratégia 1: Comparação Exata (Row-by-Row) ==========
+                def compare_exact(self, table_name, key_cols):
+                    """
+                    Comparação exata: cada linha de batch deve ter correspondente em streaming.
+                    Granularidade: por linha (chave natural)
+                    Frequência: a cada 1 hora
+                    """
+                    self.logger.info(f"Comparação Exata: {table_name}")
+                    
+                    try:
+                        # Ler batch
+                        df_batch = self.spark.read.parquet(f"/data/forge/batch/{table_name}")
+                        
+                        # Ler streaming
+                        df_streaming = self.spark.read.parquet(f"/data/forge/streaming/{table_name}")
+                        
+                        # Adicionar marcador de origem
+                        df_batch_marked = df_batch.withColumn("source", lit("batch"))
+                        df_streaming_marked = df_streaming.withColumn("source", lit("streaming"))
+                        
+                        # Unir por chave natural
+                        df_joined = df_batch_marked.join(
+                            df_streaming_marked,
+                            on=key_cols,
+                            how="full_outer"
+                        )
+                        
+                        # Encontrar divergências
+                        df_divergences = df_joined.filter(
+                            (col("source_batch").isNull()) | (col("source_streaming").isNull())
+                        )
+                        
+                        divergence_count = df_divergences.count()
+                        batch_count = df_batch.count()
+                        streaming_count = df_streaming.count()
+                        
+                        divergence_rate = (divergence_count / batch_count * 100) if batch_count > 0 else 0
+                        
+                        result = {
+                            "table": table_name,
+                            "strategy": "exact",
+                            "batch_count": batch_count,
+                            "streaming_count": streaming_count,
+                            "divergence_count": divergence_count,
+                            "divergence_rate_percent": divergence_rate,
+                            "status": "PASS" if divergence_rate < 0.1 else "FAIL"
+                        }
+                        
+                        self.logger.info(f"  Batch: {batch_count}, Streaming: {streaming_count}, Divergências: {divergence_count} ({divergence_rate:.2f}%)")
+                        
+                        return result, df_divergences
+                    
+                    except Exception as e:
+                        self.logger.error(f"Erro em comparação exata: {e}")
+                        return {
+                            "table": table_name,
+                            "strategy": "exact",
+                            "status": "ERROR",
+                            "error": str(e)
+                        }, None
+                
+                # ========== Estratégia 2: Comparação de Agregações ==========
+                def compare_aggregations(self, table_name, group_cols, agg_cols):
+                    """
+                    Comparação de agregações: SUM, COUNT, AVG por grupo.
+                    Granularidade: por grupo (ex: por tenant, por service)
+                    Frequência: a cada 1 hora
+                    """
+                    self.logger.info(f"Comparação de Agregações: {table_name}")
+                    
+                    try:
+                        # Ler batch
+                        df_batch = self.spark.read.parquet(f"/data/forge/batch/{table_name}")
+                        
+                        # Ler streaming
+                        df_streaming = self.spark.read.parquet(f"/data/forge/streaming/{table_name}")
+                        
+                        # Agregar batch
+                        agg_dict = {col: "sum" for col in agg_cols}
+                        df_batch_agg = df_batch.groupBy(*group_cols).agg(agg_dict)
+                        df_batch_agg = df_batch_agg.withColumn("source", lit("batch"))
+                        
+                        # Agregar streaming
+                        df_streaming_agg = df_streaming.groupBy(*group_cols).agg(agg_dict)
+                        df_streaming_agg = df_streaming_agg.withColumn("source", lit("streaming"))
+                        
+                        # Unir
+                        df_joined = df_batch_agg.join(
+                            df_streaming_agg,
+                            on=group_cols,
+                            how="full_outer"
+                        )
+                        
+                        # Calcular diferenças
+                        df_diff = df_joined.select(
+                            *group_cols,
+                            *[
+                                when(
+                                    col(f"{col}_batch").isNull(),
+                                    lit(None)
+                                ).otherwise(
+                                    spark_abs(col(f"{col}_batch") - coalesce(col(f"{col}_streaming"), lit(0)))
+                                ).alias(f"{col}_diff")
+                                for col in agg_cols
+                            ]
+                        )
+                        
+                        # Encontrar divergências (diferença > 1%)
+                        df_divergences = df_diff.filter(
+                            (col(f"{agg_cols[0]}_diff") > 0.01 * col(f"{agg_cols[0]}_batch"))
+                        )
+                        
+                        divergence_count = df_divergences.count()
+                        group_count = df_batch_agg.count()
+                        divergence_rate = (divergence_count / group_count * 100) if group_count > 0 else 0
+                        
+                        result = {
+                            "table": table_name,
+                            "strategy": "aggregations",
+                            "group_count": group_count,
+                            "divergence_count": divergence_count,
+                            "divergence_rate_percent": divergence_rate,
+                            "status": "PASS" if divergence_rate < 0.1 else "FAIL"
+                        }
+                        
+                        self.logger.info(f"  Grupos: {group_count}, Divergências: {divergence_count} ({divergence_rate:.2f}%)")
+                        
+                        return result, df_divergences
+                    
+                    except Exception as e:
+                        self.logger.error(f"Erro em comparação de agregações: {e}")
+                        return {
+                            "table": table_name,
+                            "strategy": "aggregations",
+                            "status": "ERROR",
+                            "error": str(e)
+                        }, None
+                
+                # ========== Estratégia 3: Comparação de Distribuição ==========
+                def compare_distribution(self, table_name, value_col, bucket_count=10):
+                    """
+                    Comparação de distribuição: histograma de valores.
+                    Granularidade: por bucket (ex: latência 0-10ms, 10-20ms, etc)
+                    Frequência: a cada 1 hora
+                    """
+                    self.logger.info(f"Comparação de Distribuição: {table_name}")
+                    
+                    try:
+                        # Ler batch
+                        df_batch = self.spark.read.parquet(f"/data/forge/batch/{table_name}")
+                        
+                        # Ler streaming
+                        df_streaming = self.spark.read.parquet(f"/data/forge/streaming/{table_name}")
+                        
+                        # Calcular min/max
+                        batch_min = df_batch.agg({value_col: "min"}).collect()[0][0]
+                        batch_max = df_batch.agg({value_col: "max"}).collect()[0][0]
+                        streaming_min = df_streaming.agg({value_col: "min"}).collect()[0][0]
+                        streaming_max = df_streaming.agg({value_col: "max"}).collect()[0][0]
+                        
+                        # Usar range comum
+                        min_val = min(batch_min, streaming_min)
+                        max_val = max(batch_max, streaming_max)
+                        bucket_size = (max_val - min_val) / bucket_count
+                        
+                        # Criar buckets
+                        df_batch_bucketed = df_batch.withColumn(
+                            "bucket",
+                            ((col(value_col) - lit(min_val)) / lit(bucket_size)).cast("int")
+                        )
+                        df_streaming_bucketed = df_streaming.withColumn(
+                            "bucket",
+                            ((col(value_col) - lit(min_val)) / lit(bucket_size)).cast("int")
+                        )
+                        
+                        # Contar por bucket
+                        df_batch_dist = df_batch_bucketed.groupBy("bucket").count().withColumn("source", lit("batch"))
+                        df_streaming_dist = df_streaming_bucketed.groupBy("bucket").count().withColumn("source", lit("streaming"))
+                        
+                        # Unir
+                        df_joined = df_batch_dist.join(
+                            df_streaming_dist,
+                            on="bucket",
+                            how="full_outer"
+                        )
+                        
+                        # Calcular diferenças percentuais
+                        df_diff = df_joined.select(
+                            col("bucket"),
+                            coalesce(col("count_batch"), lit(0)).alias("count_batch"),
+                            coalesce(col("count_streaming"), lit(0)).alias("count_streaming"),
+                            when(
+                                col("count_batch") == 0,
+                                lit(0)
+                            ).otherwise(
+                                spark_abs(col("count_batch") - col("count_streaming")) / col("count_batch") * 100
+                            ).alias("diff_percent")
+                        )
+                        
+                        # Encontrar divergências (diferença > 10%)
+                        df_divergences = df_diff.filter(col("diff_percent") > 10)
+                        
+                        divergence_count = df_divergences.count()
+                        bucket_count_total = df_diff.count()
+                        divergence_rate = (divergence_count / bucket_count_total * 100) if bucket_count_total > 0 else 0
+                        
+                        result = {
+                            "table": table_name,
+                            "strategy": "distribution",
+                            "bucket_count": bucket_count_total,
+                            "divergence_count": divergence_count,
+                            "divergence_rate_percent": divergence_rate,
+                            "status": "PASS" if divergence_rate < 0.1 else "FAIL"
+                        }
+                        
+                        self.logger.info(f"  Buckets: {bucket_count_total}, Divergências: {divergence_count} ({divergence_rate:.2f}%)")
+                        
+                        return result, df_divergences
+                    
+                    except Exception as e:
+                        self.logger.error(f"Erro em comparação de distribuição: {e}")
+                        return {
+                            "table": table_name,
+                            "strategy": "distribution",
+                            "status": "ERROR",
+                            "error": str(e)
+                        }, None
+                
+                # ========== Estratégia 4: Comparação de Timing ==========
+                def compare_timing(self, table_name, timestamp_col):
+                    """
+                    Comparação de timing: latência entre batch e streaming.
+                    Granularidade: por hora
+                    Frequência: a cada 1 hora
+                    """
+                    self.logger.info(f"Comparação de Timing: {table_name}")
+                    
+                    try:
+                        # Ler batch
+                        df_batch = self.spark.read.parquet(f"/data/forge/batch/{table_name}")
+                        
+                        # Ler streaming
+                        df_streaming = self.spark.read.parquet(f"/data/forge/streaming/{table_name}")
+                        
+                        # Calcular latência média
+                        batch_latency = df_batch.agg({timestamp_col: "avg"}).collect()[0][0]
+                        streaming_latency = df_streaming.agg({timestamp_col: "avg"}).collect()[0][0]
+                        
+                        latency_diff = abs(batch_latency - streaming_latency) if batch_latency and streaming_latency else None
+                        
+                        result = {
+                            "table": table_name,
+                            "strategy": "timing",
+                            "batch_avg_latency_ms": batch_latency,
+                            "streaming_avg_latency_ms": streaming_latency,
+                            "latency_diff_ms": latency_diff,
+                            "status": "PASS" if latency_diff is None or latency_diff < 1000 else "FAIL"  # < 1 s
+                        }
+                        
+                        self.logger.info(f"  Batch latência: {batch_latency}ms, Streaming latência: {streaming_latency}ms, Diferença: {latency_diff}ms")
+                        
+                        return result, None
+                    
+                    except Exception as e:
+                        self.logger.error(f"Erro em comparação de timing: {e}")
+                        return {
+                            "table": table_name,
+                            "strategy": "timing",
+                            "status": "ERROR",
+                            "error": str(e)
+                        }, None
+                
+                def run_reconciliation(self):
+                    """Executar reconciliação completa"""
+                    self.logger.info("Iniciando reconciliação batch vs streaming")
+                    
+                    # Tabelas a reconciliar
+                    tables = {
+                        "aggregated": {
+                            "key_cols": ["window_start", "window_end", "tenant_id"],
+                            "agg_cols": ["request_count", "error_count"],
+                            "value_col": "request_count",
+                            "timestamp_col": "ingestion_timestamp"
+                        },
+                        "by_service": {
+                            "key_cols": ["window_start", "window_end", "tenant_id", "service_id"],
+                            "agg_cols": ["request_count", "error_count"],
+                            "value_col": "request_count",
+                            "timestamp_col": "ingestion_timestamp"
+                        },
+                        "billing_events": {
+                            "key_cols": ["day_start", "tenant_id"],
+                            "agg_cols": ["unique_event_count"],
+                            "value_col": "unique_event_count",
+                            "timestamp_col": "ingestion_timestamp"
+                        },
+                    }
+                    
+                    for table_name, config in tables.items():
+                        self.logger.info(f"\n=== Reconciliando {table_name} ===")
+                        
+                        # Estratégia 1: Comparação Exata
+                        result_exact, div_exact = self.compare_exact(table_name, config["key_cols"])
+                        self.report["comparisons"][f"{table_name}_exact"] = result_exact
+                        
+                        # Estratégia 2: Comparação de Agregações
+                        result_agg, div_agg = self.compare_aggregations(table_name, config["key_cols"][:2], config["agg_cols"])
+                        self.report["comparisons"][f"{table_name}_agg"] = result_agg
+                        
+                        # Estratégia 3: Comparação de Distribuição
+                        result_dist, div_dist = self.compare_distribution(table_name, config["value_col"])
+                        self.report["comparisons"][f"{table_name}_dist"] = result_dist
+                        
+                        # Estratégia 4: Comparação de Timing
+                        result_timing, _ = self.compare_timing(table_name, config["timestamp_col"])
+                        self.report["comparisons"][f"{table_name}_timing"] = result_timing
+                        
+                        # Salvar divergências
+                        if div_exact is not None and div_exact.count() > 0:
+                            div_exact.write.mode("append").parquet(f"/data/forge/reconciliation/divergences/{table_name}_exact")
+                        if div_agg is not None and div_agg.count() > 0:
+                            div_agg.write.mode("append").parquet(f"/data/forge/reconciliation/divergences/{table_name}_agg")
+                        if div_dist is not None and div_dist.count() > 0:
+                            div_dist.write.mode("append").parquet(f"/data/forge/reconciliation/divergences/{table_name}_dist")
+                    
+                    # Determinar status geral
+                    all_pass = all(
+                        comp.get("status") == "PASS"
+                        for comp in self.report["comparisons"].values()
+                        if comp.get("status") in ["PASS", "FAIL"]
+                    )
+                    self.report["status"] = "PASS" if all_pass else "FAIL"
+                    
+                    self.logger.info(f"\nStatus geral: {self.report['status']}")
+                    
+                    return self.report
+                
+                def save_report(self, output_file):
+                    """Salvar relatório em JSON"""
+                    with open(output_file, "w") as f:
+                        json.dump(self.report, f, indent=2, default=str)
+                    self.logger.info(f"Relatório salvo em: {output_file}")
+
+            def create_spark_session():
+                """Cria sessão Spark"""
+                return SparkSession.builder \
+                    .appName("forge-reconciliation") \
+                    .getOrCreate()
+
+            def main():
+                """Função principal"""
+                spark = create_spark_session()
+                reconciliation = ReconciliationJob(spark)
+                
+                # Executar reconciliação
+                report = reconciliation.run_reconciliation()
+                
+                # Salvar relatório
+                output_file = f"reconciliation_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+                reconciliation.save_report(output_file)
+                
+                # Retornar código de saída
+                exit(0 if report["status"] == "PASS" else 1)
+
+            if __name__ == "__main__":
+                main()
+            ```
+
+            **Verificação:**
+
+            ```bash
+            # Testar job de reconciliação
+            spark-submit \
+            --master local[4] \
+            forge/jobs/reconciliation_job.py
+
+            # Esperado: relatório JSON com comparações de todas as estratégias
+            # Saída: "Status geral: PASS" ou "Status geral: FAIL"
+
+            # Verificar relatório
+            cat reconciliation_report_*.json | jq '.comparisons'
+            # Esperado: múltiplas estratégias com status PASS/FAIL
+            ```
+
+            ---
+
+            ## 3. Crie relatório de divergências: classificação, escalação, runbook
+
+            **Ação:** Implementar script que classifica divergências e escala quando passar de 0,1% das linhas por hora.
+
+            **Onde:** Arquivo `forge/jobs/divergence_classifier.py` (novo) no repositório do Forge.
+
+            **Procedimento:**
+
+            ```python
+            #!/usr/bin/env python3
+            """
+            Classificador de Divergências — Dual-Run Batch vs Streaming
+            Classifica divergências como esperadas, por timing ou por bug.
+            Escala quando taxa de divergência > 0,1%.
+            """
+            from pyspark.sql import SparkSession
+            from pyspark.sql.functions import (
+                col, when, lit, current_timestamp, datediff, abs as spark_abs
+            )
+            import logging
+            from datetime import datetime, timedelta
+            import json
+            import requests
+
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            class DivergenceClassifier:
+                """Classificador de divergências"""
+                
+                def __init__(self, spark, slack_webhook=None):
+                    self.spark = spark
+                    self.slack_webhook = slack_webhook
+                    self.logger = logger
+                    self.report = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "divergences": [],
+                        "classification": {
+                            "expected": 0,
+                            "timing": 0,
+                            "bug": 0,
+                            "unknown": 0
+                        },
+                        "escalation": {
+                            "triggered": False,
+                            "reason": None,
+                            "threshold": 0.001,  # 0,1%
+                            "actual_rate": 0
+                        }
+                    }
+                
+                def classify_divergence(self, divergence_row, table_name, strategy):
+                    """
+                    Classificar uma divergência.
+                    
+                    Retorna: {"type": "expected|timing|bug|unknown", "reason": "..."}
+                    """
+                    
+                    # Extrair campos
+                    batch_data = divergence_row.get("batch_data", {})
+                    streaming_data = divergence_row.get("streaming_data", {})
+                    
+                    # Classificação 1: Divergência Esperada (Timing)
+                    # Se batch e streaming têm timestamps diferentes, é esperado
+                    if "ingestion_timestamp" in batch_data and "ingestion_timestamp" in streaming_data:
+                        batch_ts = batch_data["ingestion_timestamp"]
+                        streaming_ts = streaming_data["ingestion_timestamp"]
+                        
+                        # Se diferença é < 5 min, é timing (esperado durante dual-run)
+                        if abs(batch_ts - streaming_ts) < 300000:  # 5 min em ms
+                            return {
+                                "type": "timing",
+                                "reason": f"Timestamps diferem por {abs(batch_ts - streaming_ts)}ms (< 5 min)",
+                                "severity": "LOW"
+                            }
+                    
+                    # Classificação 2: Divergência Esperada (Deduplicação)
+                    # Se batch tem duplicatas e streaming não, é esperado
+                    if table_name in ["aggregated", "by_service", "billing_events"]:
+                        batch_count = batch_data.get("event_count", 0)
+                        streaming_count = streaming_data.get("event_count", 0)
+                        
+                        # Se streaming tem menos eventos, pode ser deduplicação
+                        if streaming_count < batch_count and (batch_count - streaming_count) / batch_count < 0.01:
+                            return {
+                                "type": "expected",
+                                "reason": f"Streaming deduplicou {batch_count - streaming_count} eventos (< 1%)",
+                                "severity": "LOW"
+                            }
+                    
+                    # Classificação 3: Divergência Esperada (Watermark)
+                    # Se streaming tem menos dados, pode ser watermark
+                    if "window_end" in batch_data and "window_end" in streaming_data:
+                        batch_window_end = batch_data["window_end"]
+                        streaming_window_end = streaming_data["window_end"]
+                        
+                        # Se streaming está atrasado por < 2 min, é watermark
+                        if batch_window_end > streaming_window_end:
+                            lag_ms = batch_window_end - streaming_window_end
+                            if lag_ms < 120000:  # 2 min em ms
+                                return {
+                                    "type": "timing",
+                                    "reason": f"Streaming está {lag_ms}ms atrás (watermark)",
+                                    "severity": "LOW"
+                                }
+                    
+                    # Classificação 4: Divergência por Bug
+                    # Se valores são muito diferentes (> 10%), é bug
+                    if "request_count" in batch_data and "request_count" in streaming_data:
+                        batch_count = batch_data["request_count"]
+                        streaming_count = streaming_data["request_count"]
+                        
+                        if batch_count > 0:
+                            diff_percent = abs(batch_count - streaming_count) / batch_count * 100
+                            if diff_percent > 10:
+                                return {
+                                    "type": "bug",
+                                    "reason": f"Request count diferem por {diff_percent:.1f}% (batch={batch_count}, streaming={streaming_count})",
+                                    "severity": "HIGH"
+                                }
+                    
+                    # Classificação 5: Desconhecida
+                    return {
+                        "type": "unknown",
+                        "reason": "Não conseguiu classificar divergência",
+                        "severity": "MEDIUM"
+                    }
+                
+                def classify_all_divergences(self, table_name, strategy):
+                    """Classificar todas as divergências de uma tabela"""
+                    self.logger.info(f"Classificando divergências: {table_name} ({strategy})")
+                    
+                    try:
+                        # Ler divergências
+                        df_divergences = self.spark.read.parquet(
+                            f"/data/forge/reconciliation/divergences/{table_name}_{strategy}"
+                        )
+                        
+                        # Classificar cada linha
+                        classifications = []
+                        for row in df_divergences.collect():
+                            classification = self.classify_divergence(row.asDict(), table_name, strategy)
+                            classifications.append({
+                                "table": table_name,
+                                "strategy": strategy,
+                                "row": row.asDict(),
+                                "classification": classification
+                            })
+                            
+                            # Atualizar contadores
+                            self.report["classification"][classification["type"]] += 1
+                        
+                        self.report["divergences"].extend(classifications)
+                        
+                        return classifications
+                    
+                    except Exception as e:
+                        self.logger.error(f"Erro ao classificar divergências: {e}")
+                        return []
+                
+                def check_escalation(self, total_rows, divergence_count):
+                    """
+                    Verificar se taxa de divergência passou do threshold.
+                    Threshold: 0,1% das linhas por hora
+                    """
+                    self.logger.info(f"Verificando escalação: {divergence_count}/{total_rows} divergências")
+                    
+                    if total_rows == 0:
+                        return False
+                    
+                    divergence_rate = divergence_count / total_rows
+                    self.report["escalation"]["actual_rate"] = divergence_rate
+                    
+                    if divergence_rate > self.report["escalation"]["threshold"]:
+                        self.report["escalation"]["triggered"] = True
+                        self.report["escalation"]["reason"] = f"Taxa de divergência {divergence_rate:.2%} > {self.report['escalation']['threshold']:.2%}"
+                        self.logger.error(f"⚠️  ESCALAÇÃO DISPARADA: {self.report['escalation']['reason']}")
+                        return True
+                    
+                    self.logger.info(f"✅ Taxa de divergência {divergence_rate:.2%} < {self.report['escalation']['threshold']:.2%}")
+                    return False
+                
+                def send_escalation_alert(self, reason):
+                    """Enviar alerta de escalação para Slack"""
+                    if not self.slack_webhook:
+                        self.logger.warning("Slack webhook não configurado, não enviando alerta")
+                        return
+                    
+                    message = f"""
+            🚨 ESCALAÇÃO: Dual-Run Batch vs Streaming
+
+            Razão: {reason}
+
+            Taxa de divergência: {self.report['escalation']['actual_rate']:.2%}
+            Threshold: {self.report['escalation']['threshold']:.2%}
+
+            Classificação:
+            - Esperadas: {self.report['classification']['expected']}
+            - Por timing: {self.report['classification']['timing']}
+            - Por bug: {self.report['classification']['bug']}
+            - Desconhecidas: {self.report['classification']['unknown']}
+
+            Ação: Investigar divergências em /data/forge/reconciliation/divergences/
+            Runbook: https://wiki.internal/forge/runbook#dual-run-divergences
+            """
+                    
+                    try:
+                        response = requests.post(
+                            self.slack_webhook,
+                            json={"text": message}
+                        )
+                        self.logger.info(f"Alerta enviado para Slack (status={response.status_code})")
+                    except Exception as e:
+                        self.logger.error(f"Erro ao enviar alerta para Slack: {e}")
+                
+                def run_classification(self):
+                    """Executar classificação completa"""
+                    self.logger.info("Iniciando classificação de divergências")
+                    
+                    # Tabelas e estratégias
+                    tables_strategies = [
+                        ("aggregated", "exact"),
+                        ("aggregated", "agg"),
+                        ("aggregated", "dist"),
+                        ("by_service", "exact"),
+                        ("by_service", "agg"),
+                        ("billing_events", "exact"),
+                        ("billing_events", "agg"),
+                    ]
+                    
+                    total_divergences = 0
+                    total_rows = 0
+                    
+                    for table_name, strategy in tables_strategies:
+                        try:
+                            # Ler divergências
+                            df_divergences = self.spark.read.parquet(
+                                f"/data/forge/reconciliation/divergences/{table_name}_{strategy}"
+                            )
+                            divergence_count = df_divergences.count()
+                            
+                            # Ler tabela original para contar total de linhas
+                            df_batch = self.spark.read.parquet(f"/data/forge/batch/{table_name}")
+                            batch_count = df_batch.count()
+                            
+                            # Classificar
+                            self.classify_all_divergences(table_name, strategy)
+                            
+                            total_divergences += divergence_count
+                            total_rows += batch_count
+                            
+                        except Exception as e:
+                            self.logger.warning(f"Tabela {table_name} ({strategy}) não encontrada: {e}")
+                    
+                    # Verificar escalação
+                    if self.check_escalation(total_rows, total_divergences):
+                        self.send_escalation_alert(self.report["escalation"]["reason"])
+                    
+                    return self.report
+                
+                def save_report(self, output_file):
+                    """Salvar relatório em JSON"""
+                    with open(output_file, "w") as f:
+                        json.dump(self.report, f, indent=2, default=str)
+                    self.logger.info(f"Relatório salvo em: {output_file}")
+
+            def create_spark_session():
+                """Cria sessão Spark"""
+                return SparkSession.builder \
+                    .appName("forge-divergence-classifier") \
+                    .getOrCreate()
+
+            def main():
+                """Função principal"""
+                import os
+                
+                spark = create_spark_session()
+                slack_webhook = os.getenv("SLACK_WEBHOOK")
+                
+                classifier = DivergenceClassifier(spark, slack_webhook)
+                
+                # Executar classificação
+                report = classifier.run_classification()
+                
+                # Salvar relatório
+                output_file = f"divergence_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+                classifier.save_report(output_file)
+                
+                # Imprimir resumo
+                print("\n=== Resumo de Classificação ===")
+                print(f"Esperadas: {report['classification']['expected']}")
+                print(f"Por timing: {report['classification']['timing']}")
+                print(f"Por bug: {report['classification']['bug']}")
+                print(f"Desconhecidas: {report['classification']['unknown']}")
+                print(f"Escalação: {'SIM' if report['escalation']['triggered'] else 'NÃO'}")
+                
+                # Retornar código de saída
+                exit(0 if not report['escalation']['triggered'] else 1)
+
+            if __name__ == "__main__":
+                main()
+            ```
+
+            **Verificação:**
+
+            ```bash
+            # Testar classificador de divergências
+            export SLACK_WEBHOOK="https://hooks.slack.com/services/..."
+            spark-submit \
+            --master local[4] \
+            forge/jobs/divergence_classifier.py
+
+            # Esperado: relatório JSON com classificações
+            # Saída: "Escalação: NÃO" (se taxa < 0,1%)
+
+            # Verificar relatório
+            cat divergence_report_*.json | jq '.classification'
+            # Esperado: contadores de cada tipo de divergência
+            ```
+
+            ---
+
+            ## 4. Implemente monitoramento de carga: Relay e DW
+
+            **Ação:** Criar métricas para monitorar que dual-run não degrada Relay nem DW.
+
+            **Onde:** Arquivo `forge/monitoring/dual-run-load-monitoring.md` (novo) no repositório do Forge.
+
+            **Procedimento:**
+
+            ```markdown
+            # Monitoramento de Carga — Dual-Run Batch vs Streaming
+
+            ## Objetivo
+            Garantir que rodar batch e streaming em paralelo não degrada Relay nem DW.
+
+            ## Métricas de Carga
+
+            ### Categoria 1: Carga no Relay
+
+            #### Métrica 1.1: Taxa de Produção (eventos/s)
+            **Definição:** Número de eventos produzidos no Relay por segundo.
+            **Baseline (Batch):** [SUPOSIÇÃO] 1000 eventos/s
+            **Limite Aceitável:** < 1500 eventos/s (50% acima do baseline)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Taxa de Produção = rate(kafka_topic_partition_append_total[1m])
+            ```
+
+            **Alerta:**
+            ```
+            DualRunRelayProductionHigh: taxa_produção > 1500 evt/s por 5 min
+            Severidade: WARNING
+            Ação: Verificar se batch e streaming estão consumindo corretamente
+            ```
+
+            #### Métrica 1.2: Retenção de Dados no Relay
+            **Definição:** Quantidade de dados retidos no Relay (GB).
+            **Baseline (Batch):** [SUPOSIÇÃO] 100 GB (1 dia de retenção)
+            **Limite Aceitável:** < 150 GB (50% acima do baseline)
+            **Monitoramento:** A cada 1 hora
+
+            ```
+            Retenção = kafka_topic_partition_size_bytes / 1e9
+            ```
+
+            **Alerta:**
+            ```
+            DualRunRelayRetentionHigh: retenção > 150 GB por 1 hora
+            Severidade: WARNING
+            Ação: Verificar se batch e streaming estão consumindo, aumentar retenção se necessário
+            ```
+
+            #### Métrica 1.3: Latência de Produção
+            **Definição:** Tempo entre evento ser produzido e estar disponível no Relay.
+            **Baseline (Batch):** [SUPOSIÇÃO] 100 ms
+            **Limite Aceitável:** < 200 ms (2× baseline)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Latência = histogram_quantile(0.95, rate(kafka_producer_latency_seconds_bucket[1m]))
+            ```
+
+            **Alerta:**
+            ```
+            DualRunRelayLatencyHigh: latência > 200 ms por 5 min
+            Severidade: WARNING
+            Ação: Verificar performance do Relay, aumentar partições se necessário
+            ```
+
+            ### Categoria 2: Carga no Data Warehouse
+
+            #### Métrica 2.1: Taxa de Escrita (eventos/s)
+            **Definição:** Número de eventos escritos no DW por segundo.
+            **Baseline (Batch):** [SUPOSIÇÃO] 500 eventos/s (durante lote)
+            **Limite Aceitável:** < 1000 eventos/s (2× baseline, batch + streaming)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Taxa de Escrita = rate(forge_events_written_total[1m])
+            ```
+
+            **Alerta:**
+            ```
+            DualRunDWWriteRateHigh: taxa_escrita > 1000 evt/s por 5 min
+            Severidade: WARNING
+            Ação: Verificar performance do DW, aumentar paralelismo se necessário
+            ```
+
+            #### Métrica 2.2: Espaço em Disco
+            **Definição:** Espaço em disco usado no DW (GB).
+            **Baseline (Batch):** [SUPOSIÇÃO] 500 GB (dados de 1 dia)
+            **Limite Aceitável:** < 750 GB (50% acima do baseline, batch + streaming)
+            **Monitoramento:** A cada 1 hora
+
+            ```
+            Espaço em Disco = node_filesystem_avail_bytes{mountpoint="/data/forge"} / 1e9
+            ```
+
+            **Alerta:**
+            ```
+            DualRunDWDiskSpaceHigh: espaço_usado > 750 GB por 1 hora
+            Severidade: WARNING
+            Ação: Verificar se dados estão sendo limpados, aumentar capacidade se necessário
+            ```
+
+            #### Métrica 2.3: Latência de Escrita
+            **Definição:** Tempo para escrever um lote de dados no DW.
+            **Baseline (Batch):** [SUPOSIÇÃO] 10 s
+            **Limite Aceitável:** < 20 s (2× baseline)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Latência = histogram_quantile(0.95, rate(forge_write_latency_seconds_bucket[1m]))
+            ```
+
+            **Alerta:**
+            ```
+            DualRunDWWriteLatencyHigh: latência > 20 s por 5 min
+            Severidade: WARNING
+            Ação: Verificar performance do DW, aumentar recursos se necessário
+            ```
+
+            #### Métrica 2.4: Número de Arquivos
+            **Definição:** Número de arquivos Parquet no DW.
+            **Baseline (Batch):** [SUPOSIÇÃO] 1000 arquivos (1 por hora × 24 horas × 11 tabelas)
+            **Limite Aceitável:** < 2000 arquivos (2× baseline, batch + streaming)
+            **Monitoramento:** A cada 1 hora
+
+            ```
+            Número de Arquivos = count(files in /data/forge/)
+            ```
+
+            **Alerta:**
+            ```
+            DualRunDWFileCountHigh: número_arquivos > 2000 por 1 hora
+            Severidade: INFO
+            Ação: Considerar compactação se performance degradar
+            ```
+
+            ### Categoria 3: Carga no Cluster Spark
+
+            #### Métrica 3.1: CPU
+            **Definição:** Utilização de CPU do cluster Spark.
+            **Baseline (Batch):** [SUPOSIÇÃO] 50% (durante lote)
+            **Limite Aceitável:** < 80% (durante dual-run)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            CPU = rate(process_cpu_seconds_total[1m]) * 100
+            ```
+
+            **Alerta:**
+            ```
+            DualRunSparkCPUHigh: cpu > 80% por 5 min
+            Severidade: WARNING
+            Ação: Verificar se batch e streaming estão competindo, aumentar cluster se necessário
+            ```
+
+            #### Métrica 3.2: Memória
+            **Definição:** Utilização de memória do cluster Spark.
+            **Baseline (Batch):** [SUPOSIÇÃO] 60% (durante lote)
+            **Limite Aceitável:** < 85% (durante dual-run)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Memória = (jvm_memory_used_bytes / jvm_memory_max_bytes) * 100
+            ```
+
+            **Alerta:**
+            ```
+            DualRunSparkMemoryHigh: memória > 85% por 5 min
+            Severidade: WARNING
+            Ação: Verificar se há vazamento de memória, aumentar cluster se necessário
+            ```
+
+            #### Métrica 3.3: Número de Tasks
+            **Definição:** Número de tasks em execução no cluster Spark.
+            **Baseline (Batch):** [SUPOSIÇÃO] 100 tasks (durante lote)
+            **Limite Aceitável:** < 200 tasks (2× baseline, batch + streaming)
+            **Monitoramento:** A cada 1 min
+
+            ```
+            Número de Tasks = spark_executor_task_count
+            ```
+
+            **Alerta:**
+            ```
+            DualRunSparkTaskCountHigh: número_tasks > 200 por 5 min
+            Severidade: INFO
+            Ação: Verificar se batch e streaming estão competindo
+            ```
+
+            ## Validação de Carga
+
+            ### Checklist de Validação
+
+            - [ ] Taxa de produção no Relay < 1500 evt/s
+            - [ ] Retenção de dados no Relay < 150 GB
+            - [ ] Latência de produção no Relay < 200 ms
+            - [ ] Taxa de escrita no DW < 1000 evt/s
+            - [ ] Espaço em disco no DW < 750 GB
+            - [ ] Latência de escrita no DW < 20 s
+            - [ ] Número de arquivos no DW < 2000
+            - [ ] CPU do cluster Spark < 80%
+            - [ ] Memória do cluster Spark < 85%
+            - [ ] Número de tasks no cluster Spark < 200
+
+            ### Teste de Carga
+
+            ```bash
+            #!/bin/bash
+            # Script para validar que dual-run não degrada carga
+
+            # 1. Verificar taxa de produção no Relay
+            RELAY_RATE=$(curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=rate(kafka_topic_partition_append_total[1m])' | \
+            jq '.data.result[0].value[1]' | tr -d '"')
+
+            if (( $(echo "$RELAY_RATE < 1500" | bc -l) )); then
+            echo "✅ Taxa de produção no Relay: ${RELAY_RATE} evt/s (< 1500)"
+            else
+            echo "❌ Taxa de produção no Relay: ${RELAY_RATE} evt/s (> 1500)"
+            exit 1
+            fi
+
+            # 2. Verificar espaço em disco no DW
+            DW_SPACE=$(df /data/forge | tail -1 | awk '{print $3}')
+            DW_SPACE_GB=$((DW_SPACE / 1024 / 1024))
+
+            if (( DW_SPACE_GB < 750 )); then
+            echo "✅ Espaço em disco no DW: ${DW_SPACE_GB} GB (< 750)"
+            else
+            echo "❌ Espaço em disco no DW: ${DW_SPACE_GB} GB (> 750)"
+            exit 1
+            fi
+
+            # 3. Verificar CPU do cluster Spark
+            SPARK_CPU=$(curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=rate(process_cpu_seconds_total[1m]) * 100' | \
+            jq '.data.result[0].value[1]' | tr -d '"')
+
+            if (( $(echo "$SPARK_CPU < 80" | bc -l) )); then
+            echo "✅ CPU do cluster Spark: ${SPARK_CPU}% (< 80%)"
+            else
+            echo "❌ CPU do cluster Spark: ${SPARK_CPU}% (> 80%)"
+            exit 1
+            fi
+
+            echo "=== Validação de Carga Passou ==="
+            ```
+
+            ## Impacto Esperado de Dual-Run
+
+            | Métrica | Baseline (Batch) | Dual-Run (Batch + Streaming) | Aumento |
+            |---------|------------------|------------------------------|---------|
+            | Taxa de Produção (evt/s) | 1000 | 1500 | +50% |
+            | Retenção no Relay (GB) | 100 | 150 | +50% |
+            | Taxa de Escrita no DW (evt/s) | 500 | 1000 | +100% |
+            | Espaço em Disco no DW (GB) | 500 | 750 | +50% |
+            | CPU do Cluster Spark (%) | 50% | 80% | +60% |
+            | Memória do Cluster Spark (%) | 60% | 85% | +42% |
+
+            **Conclusão:** Dual-run aumenta carga em ~50-100%, mas permanece dentro de limites aceitáveis.
+
+            ## Mitigação de Carga
+
+            Se carga passar dos limites:
+
+            1. **Aumentar Retenção no Relay:** Aumentar de 1 dia para 2 dias
+            2. **Aumentar Capacidade do DW:** Adicionar mais nós ou aumentar tamanho de nó
+            3. **Aumentar Cluster Spark:** Adicionar mais executores ou aumentar memória
+            4. **Reduzir Frequência de Streaming:** Aumentar de 30 s para 60 s (trade-off com latência)
+            5. **Reduzir Frequência de Batch:** Aumentar de 60 min para 120 min (trade-off com latência)
+            ```
+
+            **Verificação:**
+
+            ```bash
+            # Confirmar que monitoramento de carga está documentado
+            grep -E "Métrica|Baseline|Limite|Alerta" forge/monitoring/dual-run-load-monitoring.md | wc -l
+            # Esperado: > 40 linhas
+
+            # Executar teste de carga
+            bash forge/scripts/test_dual_run_load.sh
+            # Esperado: "Validação de Carga Passou"
+            ```
+
+            ---
+
+            ## 5. Defina critério objetivo de "aprovado para cutover" ao fim de 14 dias
+
+            **Ação:** Criar documento com critérios mensuráveis para aprovação de streaming.
+
+            **Onde:** Arquivo `forge/config/cutover-approval-criteria.md` (novo) no repositório do Forge.
+
+            **Procedimento:**
+
+            ```markdown
+            # Critérios de Aprovação para Cutover — Dual-Run 14 Dias
+
+            ## Objetivo
+            Definir critérios objetivos e mensuráveis para decidir se streaming está pronto para cutover.
+
+            ## Critérios de Aprovação
+
+            ### Categoria 1: Equivalência de Dados (Reconciliação)
+
+            #### Critério 1.1: Taxa de Divergência < 0,1%
+            **Definição:** Percentual de linhas que divergem entre batch e streaming.
+            **Métrica:** `divergence_count / total_rows * 100`
+            **Threshold:** < 0,1%
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            COUNT(*) as total_rows,
+            SUM(CASE WHEN divergence_type IS NOT NULL THEN 1 ELSE 0 END) as divergence_count,
+            (SUM(CASE WHEN divergence_type IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*)) * 100 as divergence_rate
+            FROM forge.reconciliation.divergences
+            WHERE timestamp >= CURRENT_DATE - 7
+            GROUP BY table_name;
+            ```
+            **Aprovação:** Todas as tabelas têm `divergence_rate < 0.1%`
+
+            #### Critério 1.2: Divergências Classificadas como "Esperadas" ou "Timing" > 90%
+            **Definição:** Percentual de divergências que são esperadas (timing, deduplicação, watermark).
+            **Métrica:** `(expected_count + timing_count) / total_divergence_count * 100`
+            **Threshold:** > 90%
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            COUNT(*) as total_divergences,
+            SUM(CASE WHEN classification IN ('expected', 'timing') THEN 1 ELSE 0 END) as expected_timing_count,
+            (SUM(CASE WHEN classification IN ('expected', 'timing') THEN 1 ELSE 0 END) / COUNT(*)) * 100 as expected_timing_rate
+            FROM forge.reconciliation.divergences
+            WHERE timestamp >= CURRENT_DATE - 7;
+            ```
+            **Aprovação:** `expected_timing_rate > 90%`
+
+            #### Critério 1.3: Divergências por Bug < 10
+            **Definição:** Número absoluto de divergências classificadas como "bug".
+            **Métrica:** `COUNT(*) WHERE classification = 'bug'`
+            **Threshold:** < 10
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            COUNT(*) as bug_count
+            FROM forge.reconciliation.divergences
+            WHERE timestamp >= CURRENT_DATE - 7
+            AND classification = 'bug';
+            ```
+            **Aprovação:** `bug_count < 10`
+
+            ### Categoria 2: Latência (SLO)
+
+            #### Critério 2.1: Latência E2E p95 < 120 s
+            **Definição:** Latência de ponta a ponta (Relay → DW) no percentil 95.
+            **Métrica:** `histogram_quantile(0.95, forge_latency_e2e_seconds)`
+            **Threshold:** < 120 s (SLO de Etapa 2)
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```
+            curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=histogram_quantile(0.95, rate(forge_latency_e2e_seconds_bucket[7d]))' | \
+            jq '.data.result[0].value[1]'
+            ```
+            **Aprovação:** Resultado < 120
+
+            #### Critério 2.2: Latência E2E p99 < 180 s
+            **Definição:** Latência de ponta a ponta (Relay → DW) no percentil 99.
+            **Métrica:** `histogram_quantile(0.99, forge_latency_e2e_seconds)`
+            **Threshold:** < 180 s (1,5× SLO)
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```
+            curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=histogram_quantile(0.99, rate(forge_latency_e2e_seconds_bucket[7d]))' | \
+            jq '.data.result[0].value[1]'
+            ```
+            **Aprovação:** Resultado < 180
+
+            ### Categoria 3: Completude (SLO)
+
+            #### Critério 3.1: Completude ≥ 99,9%
+            **Definição:** Percentual de eventos que chegaram ao DW.
+            **Métrica:** `events_written / events_consumed * 100`
+            **Threshold:** ≥ 99,9% (SLO de Etapa 2)
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            SUM(events_consumed) as total_consumed,
+            SUM(events_written) as total_written,
+            (SUM(events_written) / SUM(events_consumed)) * 100 as completeness
+            FROM forge.monitoring.metrics
+            WHERE timestamp >= CURRENT_DATE - 7
+            AND mode = 'streaming';
+            ```
+            **Aprovação:** `completeness >= 99.9`
+
+            #### Critério 3.2: Taxa de Erro < 0,1%
+            **Definição:** Percentual de eventos que falharam.
+            **Métrica:** `errors_total / events_consumed * 100`
+            **Threshold:** < 0,1%
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            SUM(events_consumed) as total_consumed,
+            SUM(errors_total) as total_errors,
+            (SUM(errors_total) / SUM(events_consumed)) * 100 as error_rate
+            FROM forge.monitoring.metrics
+            WHERE timestamp >= CURRENT_DATE - 7
+            AND mode = 'streaming';
+            ```
+            **Aprovação:** `error_rate < 0.1`
+
+            ### Categoria 4: Disponibilidade (SLO)
+
+            #### Critério 4.1: Disponibilidade ≥ 99,5%
+            **Definição:** Percentual de tempo que streaming estava disponível.
+            **Métrica:** `(total_time - downtime) / total_time * 100`
+            **Threshold:** ≥ 99,5% (SLO de Etapa 2)
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            (1 - (SUM(downtime_seconds) / (7 * 24 * 3600))) * 100 as availability
+            FROM forge.monitoring.metrics
+            WHERE timestamp >= CURRENT_DATE - 7
+            AND mode = 'streaming';
+            ```
+            **Aprovação:** `availability >= 99.5`
+
+            #### Critério 4.2: Nenhum Alerta Crítico Não Resolvido
+            **Definição:** Alertas críticos devem ser resolvidos em < 1 hora.
+            **Métrica:** `COUNT(*) WHERE severity = 'CRITICAL' AND resolution_time > 3600`
+            **Threshold:** = 0
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT
+            COUNT(*) as unresolved_critical_alerts
+            FROM forge.monitoring.alerts
+            WHERE timestamp >= CURRENT_DATE - 7
+            AND severity = 'CRITICAL'
+            AND resolution_time > 3600;
+            ```
+            **Aprovação:** `unresolved_critical_alerts = 0`
+
+            ### Categoria 5: Carga (Não Degradação)
+
+            #### Critério 5.1: Taxa de Produção no Relay < 1500 evt/s
+            **Definição:** Dual-run não deve aumentar carga no Relay em > 50%.
+            **Métrica:** `rate(kafka_topic_partition_append_total[7d])`
+            **Threshold:** < 1500 evt/s
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```
+            curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=rate(kafka_topic_partition_append_total[7d])' | \
+            jq '.data.result[0].value[1]'
+            ```
+            **Aprovação:** Resultado < 1500
+
+            #### Critério 5.2: Espaço em Disco no DW < 750 GB
+            **Definição:** Dual-run não deve aumentar espaço em disco em > 50%.
+            **Métrica:** `node_filesystem_avail_bytes{mountpoint="/data/forge"} / 1e9`
+            **Threshold:** < 750 GB
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```bash
+            df /data/forge | tail -1 | awk '{print $3 / 1024 / 1024}'
+            ```
+            **Aprovação:** Resultado < 750
+
+            #### Critério 5.3: CPU do Cluster Spark < 80%
+            **Definição:** Dual-run não deve aumentar CPU em > 60%.
+            **Métrica:** `rate(process_cpu_seconds_total[7d]) * 100`
+            **Threshold:** < 80%
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```
+            curl -s http://prometheus:9090/api/v1/query \
+            --data-urlencode 'query=rate(process_cpu_seconds_total[7d]) * 100' | \
+            jq '.data.result[0].value[1]'
+            ```
+            **Aprovação:** Resultado < 80
+
+            ### Categoria 6: Compatibilidade com Consumidores
+
+            #### Critério 6.1: Sentinel Consegue Ler Dados
+            **Definição:** Views de compatibilidade funcionam sem erro.
+            **Métrica:** `COUNT(*) FROM forge.aggregated_hourly`
+            **Threshold:** > 0
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT COUNT(*) FROM forge.aggregated_hourly;
+            ```
+            **Aprovação:** Resultado > 0
+
+            #### Critério 6.2: Cerebro Consegue Ingerir Dados
+            **Definição:** Tópico Kafka tem eventos.
+            **Métrica:** `kafka_topic_partition_current_offset{topic="forge-events-indexed"}`
+            **Threshold:** > 0
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```bash
+            kafka-consumer-groups.sh --bootstrap-server <relay-broker> \
+            --group forge-cerebro-v1 --describe | grep forge-events-indexed
+            ```
+            **Aprovação:** Offset > 0
+
+            #### Critério 6.3: Pepper Consegue Gerar Relatório de Billing
+            **Definição:** Relatório de billing é gerado sem erro.
+            **Métrica:** `COUNT(*) FROM forge.billing_events_daily`
+            **Threshold:** > 0
+            **Período de Medição:** Últimos 7 dias de dual-run
+            **Verificação:**
+            ```sql
+            SELECT COUNT(*) FROM forge.billing_events_daily;
+            ```
+            **Aprovação:** Resultado > 0
+
+            ## Matriz de Aprovação
+
+            | Categoria | Critério | Threshold | Status |
+            |-----------|----------|-----------|--------|
+            | **Equivalência** | Taxa de Divergência | < 0,1% | ✅/❌ |
+            | | Divergências Esperadas | > 90% | ✅/❌ |
+            | | Divergências por Bug | < 10 | ✅/❌ |
+            | **Latência** | p95 | < 120 s | ✅/❌ |
+            | | p99 | < 180 s | ✅/❌ |
+            | **Completude** | Completude | ≥ 99,9% | ✅/❌ |
+            | | Taxa de Erro | < 0,1% | ✅/❌ |
+            | **Disponibilidade** | Disponibilidade | ≥ 99,5% | ✅/❌ |
+            | | Alertas Críticos | = 0 | ✅/❌ |
+            | **Carga** | Taxa de Produção | < 1500 evt/s | ✅/❌ |
+            | | Espaço em Disco | < 750 GB | ✅/❌ |
+            | | CPU | < 80% | ✅/❌ |
+            | **Consumidores** | Sentinel | > 0 linhas | ✅/❌ |
+            | | Cerebro | > 0 offset | ✅/❌ |
+            | | Pepper | > 0 linhas | ✅/❌ |
+
+            ## Decisão de Cutover
+
+            **Aprovado para Cutover:** Todos os critérios têm status ✅
+
+            **Não Aprovado:** Qualquer critério tem status ❌
+
+            **Ação se Não Aprovado:**
+            1. Investigar critério que falhou
+            2. Corrigir problema em streaming
+            3. Estender dual-run por mais 7 dias
+            4. Reavaliação ao fim de 14 dias (total 21 dias)
+
+            ## Processo de Aprovação
+
+            ### Passo 1: Coleta de Dados (Dia 14)
+            ```bash
+            # Executar script de coleta de dados
+            python3 forge/scripts/collect_approval_metrics.py
+            # Saída: approval_metrics_day14.json
+            ```
+
+            ### Passo 2: Avaliação (Dia 14)
+            ```bash
+            # Executar script de avaliação
+            python3 forge/scripts/evaluate_approval_criteria.py \
+            --metrics approval_metrics_day14.json
+            # Saída: approval_report_day14.json
+            ```
+
+            ### Passo 3: Revisão (Dia 14)
+            - Tech Lead do Forge revisa relatório
+            - Tech Leads de Sentinel, Cerebro, Pepper revisam compatibilidade
+            - Decisão: Aprovado ou Não Aprovado
+
+            ### Passo 4: Comunicação (Dia 14)
+            - Se Aprovado: Agendar cutover para Dia 15
+            - Se Não Aprovado: Comunicar problema, estender dual-run
+
+            ## Exemplo de Relatório de Aprovação
+
+            ```json
+            {
+            "timestamp": "2024-01-29T00:00:00Z",
+            "dual_run_days": 14,
+            "approval_status": "APPROVED",
+            "criteria": {
+                "equivalence": {
+                "divergence_rate": 0.08,
+                "expected_timing_rate": 92.5,
+                "bug_count": 3,
+                "status": "PASS"
+                },
+                "latency": {
+                "p95_seconds": 115,
+                "p99_seconds": 175,
+                "status": "PASS"
+                },
+                "completeness": {
+                "completeness_percent": 99.92,
+                "error_rate_percent": 0.08,
+                "status": "PASS"
+                },
+                "availability": {
+                "availability_percent": 99.6,
+                "unresolved_critical_alerts": 0,
+                "status": "PASS"
+                },
+                "load": {
+                "relay_production_rate": 1450,
+                "dw_disk_space_gb": 720,
+                "spark_cpu_percent": 78,
+                "status": "PASS"
+                },
+                "consumers": {
+                "sentinel_rows": 50000,
+                "cerebro_offset": 1000000,
+                "pepper_rows": 1000,
+                "status": "PASS"
+                }
+            },
+            "recommendation": "APPROVED FOR CUTOVER",
+            "next_steps": [
+                "Agendar cutover para 2024-01-30",
+                "Notificar Sentinel, Cerebro, Pepper",
+                "Preparar runbook de cutover",
+                "Executar cutover em horário de baixo tráfego"
+            ]
+            }
+            ```
+            ```
+
+            **Verificação:**
+
+            ```bash
+            # Confirmar que critérios de aprovação estão documentados
+            grep -E "Critério|Threshold|Verificação|Aprovação" forge/config/cutover-approval-criteria.md | wc -l
+            # Esperado: > 50 linhas
+
+            # Criar script de coleta de métricas
+            cat > forge/scripts/collect_approval_metrics.py << 'EOF'
+            #!/usr/bin/env python3
+            import json
+            from datetime import datetime, timedelta
+            import subprocess
+
+            metrics = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "divergence_rate": None,
+                "latency_p95": None,
+                "completeness": None,
+                "availability": None,
+                "relay_production_rate": None,
+                "dw_disk_space": None,
+                "spark_cpu": None
+            }
+
+            # Coletar cada métrica
+            # [Implementação específica para cada métrica]
+
+            with open("approval_metrics_day14.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+
+            print("Métricas coletadas em approval_metrics_day14.json")
+            EOF
+
+            chmod +x forge/scripts/collect_approval_metrics.py
+            ```
+
+            ---
+
+            ## X. Ponto de não-retorno
+
+            **Ponto de não-retorno:** Após o passo 3 (deploy de classificador de divergências em produção), o sistema começa a monitorar divergências e pode escalar automaticamente.
+
+            **Por quê:** Uma vez que classificador está ativo, remover dual-run requer:
+            1. Parar job de reconciliação
+            2. Remover dados de divergências
+            3. Perder histórico de comparação
+            4. Impossível validar que streaming é equivalente a batch
+            5. Risco de cutover sem validação adequada
+
+            **Mitigação:** Antes do passo 3, testar reconciliação e classificação em staging (passos 1–2).
+
+            ---
+
+            ## Y. Rollback
+
+            **Procedimento de rollback (se necessário após passo 3):**
+
+            ```bash
+            #!/bin/bash
+            # Script de rollback: parar dual-run e voltar para batch
+            set -e
+            echo "=== Rollback: Parar Dual-Run, Voltar para Batch ==="
+
+            # 1. Parar job de streaming
+            echo "1. Parando job de streaming..."
+            kubectl delete deployment forge-streaming-transform -n forge
+            kubectl delete deployment forge-streaming-write -n forge
+            sleep 30
+
+            # 2. Parar job de reconciliação
+            echo "2. Parando job de reconciliação..."
+            airflow dags pause forge-reconciliation
+            airflow dags pause forge-divergence-classifier
+
+            # 3. Remover diretório de streaming
+            echo "3. Removendo diretório de streaming..."
+            rm -rf /data/forge/streaming/
+            rm -rf /data/forge/reconciliation/
+            rm -rf /data/forge/checkpoint/streaming/
+
+            # 4. Validar que batch está funcionando
+            echo "4. Validando que batch está funcionando..."
+            airflow dags trigger forge-batch-transform
+            sleep 60
+            airflow dags list | grep forge-batch-transform
+
+            # 5. Validar que consumidores estão lendo de batch
+            echo "5. Validando que consumidores estão lendo de batch..."
+            psql -h <dw-host> -U <user> -d forge -c "SELECT COUNT(*) FROM forge.aggregated_hourly;" | grep -q "^[1-9]"
+            if [ $? -eq 0 ]; then
+            echo "✅ Consumidores estão lendo de batch"
+            else
+            echo "❌ Consumidores não conseguem ler de batch"
+            exit 1
+            fi
+
+            # 6. Notificar consumidores
+            echo "6. Notificando consumidores..."
+            curl -X POST <slack-webhook> \
+            -H "Content-Type: application/json" \
+            -d '{"text": "✅ Rollback concluído. Forge voltou para batch."}'
+
+            echo "=== Rollback concluído ==="
+            ```
+
+            ---
+
+            ## Z. Critérios de conclusão
+
+            - [ ] **Isolamento:** Tabelas espelho criadas em `/data/forge/streaming/` (passo 1)
+            - [ ] **Reconciliação:** Job de reconciliação implementado com 4 estratégias (passo 2)
+            - [ ] **Classificação:** Classificador de divergências implementado com escalação automática (passo 3)
+            - [ ] **Monitoramento de Carga:** Métricas de Relay e DW documentadas (passo 4)
+            - [ ] **Critérios de Aprovação:** 16 critérios mensuráveis definidos (passo 5)
+            - [ ] **Batch e Streaming Rodando:** Ambos em paralelo por 14 dias
+            - [ ] **Consumidores Não Afetados:** Sentinel, Cerebro, Pepper continuam lendo de batch
+            - [ ] **Divergências < 0,1%:** Taxa de divergência abaixo do threshold
+            - [ ] **Latência < 120 s (p95):** SLO de latência atendido
+            - [ ] **Completude ≥ 99,9%:** SLO de completude atendido
+            - [ ] **Disponibilidade ≥ 99,5%:** SLO de disponibilidade atendido
+            - [ ] **Carga Aceitável:** Relay, DW e Spark não degradados
+            - [ ] **Relatório de Aprovação:** Gerado ao fim de 14 dias
+            - [ ] **Documentação:** Todos os arquivos criados e verificados
+            - [ ] **Suposições:** Todas marcadas com `[SUPOSIÇÃO]` e justificadas
+            - [ ] **Dados faltantes:** Lista de confirmações necessárias documentada
+
+            ---
+
+            ## W. Riscos e mitigação
+
+            | Risco | Probabilidade | Impacto | Mitigação |
+            |-------|---------------|--------|-----------|
+            | Batch e streaming competem por recursos (CPU, memória) | Alta | Médio | Monitorar carga; aumentar cluster se necessário; reduzir frequência de streaming |
+            | Relay fica sem espaço (retenção aumenta) | Média | Alto | Monitorar retenção; aumentar capacidade; reduzir retenção se necessário |
+            | DW fica sem espaço (tabelas espelho) | Média | Alto | Monitorar espaço em disco; aumentar capacidade; limpar dados antigos |
+            | Divergências são maiores que esperado (> 0,1%) | Média | Alto | Investigar causa raiz; corrigir bug em streaming; estender dual-run |
+            | Consumidores são afetados (leem de streaming por engano) | Baixa | Crítico | Usar views que apontam para batch; testar consumidores; validar queries |
+            | Reconciliação é muito lenta (não termina em 1 hora) | Média | Médio | Otimizar queries; aumentar paralelismo; reduzir granularidade |
+            | Classificador de divergências escala falso (ruído) | Média | Médio | Ajustar threshold de escalação; validar classificações; testar em staging |
+            | Dados de reconciliação ficam muito grandes (GB) | Baixa | Médio | Limpar dados antigos; usar compactação; reduzir retenção |
+            | Dual-run degrada performance de batch | Média | Alto | Monitorar latência de batch; aumentar cluster; reduzir frequência de streaming |
+            | Cutover é aprovado mas streaming tem bug não detectado | Baixa | Crítico | Usar critérios rigorosos; testar em staging; validar com consumidores |
+            | Streaming falha após cutover (sem batch para fallback) | Baixa | Crítico | Manter batch por 7 dias após cutover; ter runbook de rollback |
+            | Dados históricos de batch são perdidos (limpeza acidental) | Muito Baixa | Crítico | Fazer backup de batch antes de cutover; usar retenção de 90 dias |
+
+            ---
+
+            ## Dados faltantes e confirmações necessárias
+
+            ### Dados que faltam:
+
+            1. **Taxa real de produção no Relay:** Qual é a taxa esperada de eventos/s em produção? (Necessário para threshold de carga)
+            2. **Retenção real no Relay:** Quantos dias de dados são retidos no Relay? (Necessário para limite de espaço)
+            3. **Capacidade real do DW:** Quanto espaço em disco está disponível? (Necessário para limite de espaço)
+            4. **Capacidade real do Cluster Spark:** Quantos nós e qual é a memória total? (Necessário para limite de CPU/memória)
+            5. **Taxa real de divergência em staging:** Qual é a taxa de divergência observada em staging? (Necessário para validar threshold de 0,1%)
+            6. **Tempo real de reconciliação:** Quanto tempo leva para reconciliar todas as tabelas? (Necessário para frequência de reconciliação)
+            7. **Custo real de dual-run:** Qual é o custo adicional de rodar batch e streaming em paralelo? (Necessário para ROI)
+            8. **Política de retenção de dados:** Quantos dias de dados devem ser retidos? (Necessário para limpeza de dados)
+            9. **Janela de manutenção:** Qual é o melhor horário para rodar reconciliação? (Necessário para agendar jobs)
+            10. **Contatos de escalação:** Quem deve ser notificado se divergências passarem do threshold? (Necessário para alertas)
+
+            ### Confirmações que derrubariam/validariam escolhas futuras:
+
+            - Se **taxa de divergência > 0,5%**, aumentar threshold ou investigar bug em streaming
+            - Se **reconciliação leva > 2 horas**, reduzir granularidade ou aumentar paralelismo
+            - Se **carga no Relay > 2000 evt/s**, aumentar capacidade ou reduzir frequência de streaming
+            - Se **espaço em disco < 100 GB**, aumentar capacidade ou limpar dados antigos
+            - Se **CPU do Spark > 90%**, aumentar cluster ou reduzir frequência de batch
+            - Se **consumidores são afetados**, validar que views apontam para batch
+            - Se **cutover é aprovado mas streaming falha**, ter runbook de rollback
+            - Se **dual-run custa > 2× batch**, considerar reduzir frequência de streaming
+
+            ---
+
+            ## Suposições marcadas
+
+            | # | Suposição | Razão | Confirmação necessária |
+            |---|-----------|-------|------------------------|
+            | [SUPOSIÇÃO-1] | Taxa de produção baseline: 1000 evt/s | Baseado em volume esperado | Confirmar com dados reais de produção |
+            | [SUPOSIÇÃO-2] | Retenção baseline: 100 GB (1 dia) | Típico para Relay | Confirmar política de retenção |
+            | [SUPOSIÇÃO-3] | Limite de carga: 50% acima do baseline | Trade-off entre carga e validação | Validar com capacidade real |
+            | [SUPOSIÇÃO-4] | Threshold de divergência: 0,1% | Baseado em SLO de completude | Validar com dados de staging |
+            | [SUPOSIÇÃO-5] | Divergências esperadas: > 90% | Baseado em timing e deduplicação | Validar com dados reais |
+            | [SUPOSIÇÃO-6] | Latência E2E p95: < 120 s | SLO de Etapa 2 | Confirmar SLO |
+            | [SUPOSIÇÃO-7] | Completude: ≥ 99,9% | SLO de Etapa 2 | Confirmar SLO |
+            | [SUPOSIÇÃO-8] | Disponibilidade: ≥ 99,5% | SLO de Etapa 2 | Confirmar SLO |
+            | [SUPOSIÇÃO-9] | Dual-run dura 14 dias | Baseado em experiência com migrações | Validar com cronograma |
+            | [SUPOSIÇÃO-10] | Reconciliação roda a cada 1 hora | Trade-off entre frequência e custo | Validar com tempo de execução |
+
+            ---
+
+            ## Próximos passos (Etapa 10)
+
+            Após conclusão desta etapa (14 dias de dual-run):
+
+            1. **Coleta de Métricas (Dia 14):** Executar script de coleta de métricas de aprovação
+            2. **Avaliação (Dia 14):** Executar script de avaliação de critérios
+            3. **Revisão (Dia 14):** Tech Leads revisam relatório de aprovação
+            4. **Decisão (Dia 14):** Aprovado ou Não Aprovado para cutover
+            5. **Se Aprovado:** Prosseguir para Etapa 10 (Cutover Final)
+            6. **Se Não Aprovado:** Estender dual-run por mais 7 dias, reavaliação em Dia 21
+
+            ---
+
+            ## Apêndice: Script de Coleta de Métricas de Aprovação
+
+            ```python
+            #!/usr/bin/env python3
+            """
+            Script de Coleta de Métricas de Aprovação
+            Coleta todas as métricas necessárias para avaliar critérios de aprovação.
+            """
+            import json
+            from datetime import datetime, timedelta
+            import subprocess
+            import requests
+            import logging
+
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            class ApprovalMetricsCollector:
+                """Coleta métricas de aprovação"""
+                
+                def __init__(self, prometheus_url, dw_host, dw_user, dw_db):
+                    self.prometheus_url = prometheus_url
+                    self.dw_host = dw_host
+                    self.dw_user = dw_user
+                    self.dw_db = dw_db
+                    self.metrics = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "equivalence": {},
+                        "latency": {},
+                        "completeness": {},
+                        "availability": {},
+                        "load": {},
+                        "consumers": {}
+                    }
+                
+                def query_prometheus(self, query):
+                    """Executar query no Prometheus"""
+                    try:
+                        response = requests.get(
+                            f"{self.prometheus_url}/api/v1/query",
+                            params={"query": query}
+                        )
+                        result = response.json()
+                        if result["status"] == "success" and result["data"]["result"]:
+                            return float(result["data"]["result"][0]["value"][1])
+                        return None
+                    except Exception as e:
+                        logger.error(f"Erro ao executar query Prometheus: {e}")
+                        return None
+                
+                def query_dw(self, query):
+                    """Executar query no DW"""
+                    try:
+                        result = subprocess.run(
+                            ["psql", "-h", self.dw_host, "-U", self.dw_user,
+                            "-d", self.dw_db, "-c", query],
+                            capture_output=True,
+                            text=True,
+                            timeout=60
+                        )
+                        if result.returncode == 0:
+                            # Parse resultado
+                            lines = result.stdout.strip().split("\n")
+                            if len(lines) >= 3:
+                                return float(lines[2].strip())
+                        return None
+                    except Exception as e:
+                        logger.error(f"Erro ao executar query DW: {e}")
+                        return None
+                
+                def collect_all(self):
+                    """Coletar todas as métricas"""
+                    logger.info("Coletando métricas de aprovação...")
+                    
+                    # Equivalência
+                    self.metrics["equivalence"]["divergence_rate"] = self.query_dw(
+                        "SELECT (SUM(CASE WHEN divergence_type IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*)) * 100 "
+                        "FROM forge.reconciliation.divergences WHERE timestamp >= CURRENT_DATE - 7;"
+                    )
+                    
+                    # Latência
+                    self.metrics["latency"]["p95"] = self.query_prometheus(
+                        "histogram_quantile(0.95, rate(forge_latency_e2e_seconds_bucket[7d]))"
+                    )
+                    self.metrics["latency"]["p99"] = self.query_prometheus(
+                        "histogram_quantile(0.99, rate(forge_latency_e2e_seconds_bucket[7d]))"
+                    )
+                    
+                    # Completude
+                    self.metrics["completeness"]["completeness"] = self.query_dw(
+                        "SELECT (SUM(events_written) / SUM(events_consumed)) * 100 "
+                        "FROM forge.monitoring.metrics WHERE timestamp >= CURRENT_DATE - 7 AND mode = 'streaming';"
+                    )
+                    
+                    # Carga
+                    self.metrics["load"]["relay_production_rate"] = self.query_prometheus(
+                        "rate(kafka_topic_partition_append_total[7d])"
+                    )
+                    
+                    logger.info(f"Métricas coletadas: {json.dumps(self.metrics, indent=2)}")
+                    return self.metrics
+                
+                def save(self, output_file):
+                    """Salvar métricas em arquivo"""
+                    with open(output_file, "w") as f:
+                        json.dump(self.metrics, f, indent=2)
+                    logger.info(f"Métricas salvas em: {output_file}")
+
+            def main():
+                """Função principal"""
+                collector = ApprovalMetricsCollector(
+                    prometheus_url="http://prometheus:9090",
+                    dw_host="<dw-host>",
+                    dw_user="<dw-user>",
+                    dw_db="forge"
+                )
+                
+                metrics = collector.collect_all()
+                collector.save("approval_metrics_day14.json")
+
+            if __name__ == "__main__":
+                main()
+            ```

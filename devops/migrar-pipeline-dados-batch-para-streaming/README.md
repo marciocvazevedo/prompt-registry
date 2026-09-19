@@ -102,6 +102,18 @@ Checklist de execução:
 - [ ] E9 Dual-run e reconciliação
 - [ ] E10 Cutover incremental e desligamento do batch
 
+## Prompts por etapa e avaliação
+
+Além deste prompt-pai, cada etapa da cadeia tem uma subpasta própria — `e01-inventario-e-baseline/` a `e10-cutover-incremental-e-desligamento-do-batch/` — com o prompt isolado daquela etapa (`prompt.md`, extraído sem alteração da Seção 5 acima) e um harness de avaliação `promptfooconfig.yaml`. Cada subpasta tem seu próprio `README.md` com objetivo, dependências, placeholders (incluindo os `{{INSUMO_ETAPA_n}}`) e detalhes da avaliação. A pasta `rubric/judge-forge-streaming.xml` guarda o LLM-as-judge compartilhado pelas 10 etapas.
+
+Para rodar a avaliação de uma etapa, a partir da subpasta correspondente:
+
+```bash
+npx promptfoo eval
+```
+
+O `prompt.md` da etapa é respondido por `anthropic:messages:claude-haiku-4-5-20251001` e julgado por `openai:gpt-5` contra a rubrica de 4 critérios (C1 aderência à etapa e uso dos insumos, C2 procedimento executável e verificável, C3 reversibilidade e proteção do que já está no ar, C4 honestidade sobre o que não se sabe), `nota_total` de 0 a 8. PASS = `nota_total >= 6` e nenhum critério com nota 0 (`threshold: 0.75` no assert `llm-rubric`). Os `{{INSUMO_ETAPA_*}}` embutidos em cada `promptfooconfig.yaml` são respostas-exemplo congeladas das etapas anteriores, usadas só para a avaliação.
+
 ## Limitações conhecidas
 
 Cadeia manual: é preciso rodar um prompt por vez, colar as respostas das etapas dependentes antes de cada novo prompt e guardar cada resposta em arquivo próprio — sem isso, segundo o próprio material, a resposta "sai genérica". Os valores-padrão da tabela de parâmetros já assumem o cenário fictício da Aegis/Forge (Relay, Forge, Sentinel, Cerebro); usos fora desse cenário exigem substituir todos os `{{...}}` pelos dados reais.

@@ -1,0 +1,2381 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 40000
+      stream: true
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://../rubric/judge-forge-streaming.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a etapa de contrato de consumo do relay da cadeia Least-to-Most de migração do Forge (batch -> event-driven)
+        conforme a rubrica C1-C4, o gabarito e a regra de decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      SISTEMA: Forge
+      FONTE_EVENTOS: Relay
+      DW: data warehouse do Forge
+      CONSUMIDORES: Sentinel (tabelas agregadas), Cerebro (índice de eventos transformados), relatórios de billing da Pepper (execução de madrugada)
+      JANELA_ATUAL: 60 min
+      DURACAO_JOB: ~40 min
+      N_ETAPAS: 14
+      ENGINE: Spark
+      PARTICIONAMENTO: por hora
+      LATENCIA_ALVO: 2 min (p95, do evento no Relay até consultável no DW)
+      TAMANHO_MICRO_LOTE: 30 s
+      AMBIENTE: staging → produção
+      JANELA_DUAL_RUN: 14 dias
+      FATIA_CUTOVER: por tenant, começando pelos 5 menores
+      TOLERANCIA_DIVERGENCIA: 0,1% das linhas por hora
+      FORMATO_SAIDA: Markdown com passos numerados
+      etapa_numero: 3
+      etapa_nome: Contrato de consumo do Relay
+      INSUMO_ETAPA_1: |
+        # Etapa 1 de 10: Inventário e Baseline — Procedimento Técnico
+
+                ## 0. Pré-requisitos
+
+                - [ ] Acesso de leitura ao cluster Spark que executa `forge-batch-ingest`
+                - [ ] Acesso ao data warehouse do Forge (SQL, metastore, ou console de consultas)
+                - [ ] Acesso aos logs de execução do job cron (sistema de scheduling, ex: Airflow, cron nativo, etc.)
+                - [ ] Acesso ao Relay: tópicos, schemas, métricas de throughput
+                - [ ] Acesso aos sistemas consumidores: Sentinel, Cerebro, Pepper (logs de leitura, queries, SLAs)
+                - [ ] Ferramentas disponíveis: `spark-submit`, cliente SQL, `curl`/API para métricas, `git`
+                - [ ] Permissão para criar tabelas/views temporárias no DW sem impacto em produção
+                - [ ] Contato técnico em cada time consumidor (Sentinel, Cerebro, Pepper) para validar dados coletados
+
+                ---
+
+                ## 1. Mapeie o tópico/fila de entrada do Relay
+
+                **Ação:** Identifique e documente a origem dos dados que alimentam `forge-batch-ingest`.
+
+                **Onde:** Console/API do Relay ou repositório de configuração do Forge.
+
+                **Comando/Configuração:**
+
+                ```bash
+                # Se Relay é Kafka/Pulsar, liste o tópico
+                kafka-topics --bootstrap-server <relay-broker> --list | grep -i forge
+                # ou
+                pulsar-admin topics list <relay-namespace>
+
+                # Se Relay é fila (SQS, etc.), liste a fila
+                aws sqs list-queues --region <region> | grep -i forge
+                ```
+
+                **Verificação:** Confirme que existe exatamente um tópico/fila de entrada e anote seu nome.
+
+                ---
+
+                ## 2. Colete schema e amostra de telemetry do Relay
+
+                **Ação:** Extraia o schema Avro/Protobuf/JSON e uma amostra representativa de eventos.
+
+                **Onde:** Relay (tópico/fila) ou repositório de schemas (Schema Registry, etc.).
+
+                **Comando/Configuração:**
+
+                ```bash
+                # Se Schema Registry (Confluent/Kafka)
+                curl -s http://<schema-registry>:8081/subjects/<relay-topic>-value/versions/latest \
+                  | jq '.schema | fromjson' > /tmp/relay_schema.json
+
+                # Se Pulsar Schema
+                pulsar-admin schemas get <relay-namespace>/<relay-topic>
+
+                # Amostra de 100 eventos (últimos 5 min)
+                kafka-console-consumer --bootstrap-server <relay-broker> \
+                  --topic <relay-topic> \
+                  --from-beginning \
+                  --max-messages 100 \
+                  --property print.timestamp=true \
+                  --property print.key=true \
+                  > /tmp/relay_sample.jsonl
+                ```
+
+                **Verificação:** Arquivo `/tmp/relay_schema.json` contém schema válido; `/tmp/relay_sample.jsonl` contém ≥100 eventos com timestamps.
+
+                ---
+
+                ## 3. Meça volume e taxa de chegada do Relay
+
+                **Ação:** Quantifique throughput, tamanho médio de evento e distribuição temporal.
+
+                **Onde:** Métricas do Relay (Prometheus, CloudWatch, Datadog, etc.) ou logs de ingestão.
+
+                **Comando/Configuração:**
+
+                ```bash
+                # Via Prometheus (se disponível)
+                curl -s 'http://<prometheus>:9090/api/v1/query?query=rate(relay_messages_total[5m])' \
+                  | jq '.data.result[] | {metric: .metric, value: .value[1]}'
+
+                # Via Kafka metrics
+                kafka-consumer-groups --bootstrap-server <relay-broker> \
+                  --group forge-batch-ingest \
+                  --describe
+
+                # Via logs de aplicação (últimas 24h)
+                grep "messages_consumed\|bytes_consumed" <forge-logs> | tail -100
+                ```
+
+                **Cálculos a fazer:**
+
+                ```python
+                # Após coletar dados, calcule:
+                total_events_24h = <valor coletado>
+                avg_event_size_bytes = <tamanho médio da amostra>
+                peak_rate_events_per_sec = <pico observado>
+                avg_rate_events_per_sec = total_events_24h / 86400
+
+                print(f"Volume 24h: {total_events_24h:,} eventos")
+                print(f"Tamanho médio: {avg_event_size_bytes} bytes")
+                print(f"Taxa média: {avg_rate_events_per_sec:.1f} evt/s")
+                print(f"Taxa pico: {peak_rate_events_per_sec:.1f} evt/s")
+                print(f"Throughput médio: {avg_rate_events_per_sec * avg_event_size_bytes / 1e6:.2f} MB/s")
+                ```
+
+                **Verificação:** Números plausíveis (ex: 1M–100M eventos/dia para SaaS de observabilidade); taxa pico ≥ 2× taxa média.
+
+                ---
+
+                ## 4. Documente as 14 etapas de transformação Spark
+
+                **Ação:** Extraia do código-fonte do `forge-batch-ingest` cada etapa, entrada, saída, tipo e tempo.
+
+                **Onde:** Repositório do Forge (ex: `forge/jobs/batch_ingest.py` ou `.scala`).
+
+                **Comando/Configuração:**
+
+                ```bash
+                # Clone/acesse o repositório
+                cd <forge-repo>
+                git log --oneline forge/jobs/batch_ingest.py | head -5
+
+                # Extraia o DAG de transformações
+                grep -E "\.map\(|\.filter\(|\.groupBy\(|\.join\(|\.window\(|\.write\(" \
+                  forge/jobs/batch_ingest.py | head -20
+                ```
+
+                **Procedimento manual:**
+
+                1. Abra o arquivo principal do job (ex: `forge/jobs/batch_ingest.py`).
+                2. Identifique cada `.map()`, `.filter()`, `.groupBy()`, `.join()`, `.window()`, `.aggregate()`, `.write()`.
+                3. Para cada etapa, preencha a tabela abaixo:
+
+                | # | Nome da Etapa | Entrada | Saída | Tipo | Tempo (s) | Notas |
+                |---|---|---|---|---|---|---|
+                | 1 | Parse JSON | Relay (raw) | DataFrame estruturado | Sem estado | ? | Desserialização |
+                | 2 | Validação de schema | DF estruturado | DF validado | Sem estado | ? | Drop inválidos |
+                | 3 | Enriquecimento de tenant | DF validado | DF + tenant_id | Junção (lookup) | ? | Lookup em tabela estática |
+                | 4 | Normalização de timestamp | DF + tenant | DF normalizado | Sem estado | ? | Conversão de fuso |
+                | 5 | Agregação por tenant/hora | DF normalizado | Agregados | Agregação | ? | groupBy(tenant, hour) |
+                | 6 | Cálculo de percentis | Agregados | Agregados + p50/p95/p99 | Agregação | ? | approx_percentile |
+                | 7 | Junção com metadados | Agregados + p* | DF enriquecido | Junção | ? | Lookup em tabela de metadados |
+                | 8 | Deduplicação | DF enriquecido | DF dedupado | Sem estado | ? | dropDuplicates(event_id) |
+                | 9 | Filtro de retenção | DF dedupado | DF retido | Sem estado | ? | Descarta eventos antigos |
+                | 10 | Agregação por serviço | DF retido | Agregados por serviço | Agregação | ? | groupBy(tenant, service, hour) |
+                | 11 | Cálculo de taxa de erro | Agregados/serviço | Agregados + error_rate | Sem estado | ? | Divisão simples |
+                | 12 | Junção com SLA | Agregados + error_rate | DF com SLA | Junção | ? | Lookup em tabela de SLA |
+                | 13 | Formatação para DW | DF com SLA | Linhas formatadas | Sem estado | ? | Conversão de tipos |
+                | 14 | Escrita no DW | Linhas formatadas | Tabelas particionadas | Sem estado | ? | INSERT/UPSERT |
+
+                **Comando para extrair tempos de execução:**
+
+                ```bash
+                # Dos logs do Spark (últimas 10 execuções)
+                spark-submit --conf spark.eventLog.enabled=true \
+                  --conf spark.eventLog.dir=<event-log-dir> \
+                  forge/jobs/batch_ingest.py
+
+                # Analise o event log
+                python3 << 'EOF'
+                import json
+                import glob
+
+                for log_file in sorted(glob.glob("<event-log-dir>/*"))[-10:]:
+                    with open(log_file) as f:
+                        for line in f:
+                            event = json.loads(line)
+                            if event.get("Event") == "SparkListenerTaskEnd":
+                                stage_id = event.get("stageId")
+                                duration_ms = event.get("taskInfo", {}).get("duration", 0)
+                                print(f"Stage {stage_id}: {duration_ms}ms")
+                EOF
+                ```
+
+                **Verificação:** Tabela preenchida com ≥12 etapas; soma de tempos ≈ 40 min (2400 s).
+
+                ---
+
+                ## 5. Inventarie as tabelas do data warehouse do Forge
+
+                **Ação:** Liste todas as tabelas gravadas pelo `forge-batch-ingest`, com schema, particionamento e tamanho.
+
+                **Onde:** Data warehouse do Forge (Snowflake, BigQuery, Redshift, Delta Lake, etc.).
+
+                **Comando/Configuração:**
+
+                ```sql
+                -- Para Snowflake
+                SELECT 
+                  table_name,
+                  column_name,
+                  data_type,
+                  is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'FORGE'
+                ORDER BY table_name, ordinal_position;
+
+                -- Tamanho das tabelas
+                SELECT 
+                  table_name,
+                  row_count,
+                  bytes / 1e9 AS size_gb,
+                  CURRENT_TIMESTAMP() - last_altered AS last_modified
+                FROM information_schema.tables
+                WHERE table_schema = 'FORGE'
+                ORDER BY bytes DESC;
+
+                -- Partições (se aplicável)
+                SELECT 
+                  table_name,
+                  partition_expression,
+                  COUNT(*) AS num_partitions
+                FROM information_schema.table_partitions
+                WHERE table_schema = 'FORGE'
+                GROUP BY table_name, partition_expression;
+                ```
+
+                ```sql
+                -- Para BigQuery
+                SELECT 
+                  table_name,
+                  ROUND(size_bytes / 1e9, 2) AS size_gb,
+                  row_count,
+                  TIMESTAMP_MILLIS(creation_time) AS created,
+                  TIMESTAMP_MILLIS(CAST(UNIX_MILLIS(CURRENT_TIMESTAMP()) AS INT64)) AS now
+                FROM `<project>.forge.__TABLES__`
+                ORDER BY size_bytes DESC;
+
+                -- Schema
+                SELECT 
+                  column_name,
+                  data_type,
+                  mode
+                FROM `<project>.forge.INFORMATION_SCHEMA.COLUMNS`
+                WHERE table_name IN (
+                  SELECT table_name FROM `<project>.forge.__TABLES__`
+                )
+                ORDER BY table_name, ordinal_position;
+                ```
+
+                **Preencha a tabela:**
+
+                | Tabela | Schema (colunas principais) | Particionamento | Tamanho (GB) | Linhas | Taxa crescimento (GB/dia) | Última escrita |
+                |---|---|---|---|---|---|---|
+                | `forge_events_raw` | event_id, tenant_id, timestamp, payload | hour | ? | ? | ? | ? |
+                | `forge_events_aggregated` | tenant_id, hour, metric_name, value, p50, p95, p99 | hour | ? | ? | ? | ? |
+                | `forge_events_by_service` | tenant_id, service_id, hour, error_count, error_rate | hour | ? | ? | ? | ? |
+                | `forge_sla_violations` | tenant_id, service_id, hour, sla_breached | hour | ? | ? | ? | ? |
+                | ... | ... | ... | ... | ... | ... | ... |
+
+                **Verificação:** ≥3 tabelas documentadas; tamanho total > 100 GB (típico para SaaS de observabilidade).
+
+                ---
+
+                ## 6. Meça latência fim a fim do lote atual
+
+                **Ação:** Quantifique o tempo desde a chegada de um evento no Relay até estar consultável no DW.
+
+                **Onde:** Logs de `forge-batch-ingest`, métricas do Relay e DW.
+
+                **Procedimento:**
+
+                1. **Identifique um evento de teste:** Injete um evento com timestamp conhecido no Relay.
+
+                ```bash
+                # Injete evento com timestamp T0
+                T0=$(date +%s%N)
+                echo "{\"event_id\": \"test-$(date +%s)\", \"timestamp\": $T0, \"tenant_id\": \"test-tenant\", \"payload\": {}}" \
+                  | kafka-console-producer --broker-list <relay-broker> --topic <relay-topic>
+                ```
+
+                2. **Aguarde o próximo lote:** O job `forge-batch-ingest` roda a cada 60 min. Aguarde até 60 min + tempo de processamento.
+
+                3. **Consulte no DW:** Verifique quando o evento aparece.
+
+                ```sql
+                SELECT 
+                  event_id,
+                  timestamp,
+                  CURRENT_TIMESTAMP() AS query_time,
+                  DATEDIFF(second, timestamp, CURRENT_TIMESTAMP()) AS latency_seconds
+                FROM forge_events_raw
+                WHERE event_id = 'test-<timestamp>'
+                LIMIT 1;
+                ```
+
+                4. **Calcule latência:**
+
+                ```
+                Latência = (query_time - T0) em segundos
+                ```
+
+                **Alternativa (análise histórica):**
+
+                ```sql
+                -- Calcule latência média dos últimos 10 lotes
+                WITH lote_stats AS (
+                  SELECT 
+                    DATE_TRUNC('hour', timestamp) AS lote_hora,
+                    MIN(timestamp) AS evento_mais_antigo,
+                    MAX(timestamp) AS evento_mais_novo,
+                    COUNT(*) AS num_eventos
+                  FROM forge_events_raw
+                  WHERE timestamp >= CURRENT_TIMESTAMP() - INTERVAL '10 hours'
+                  GROUP BY DATE_TRUNC('hour', timestamp)
+                )
+                SELECT 
+                  lote_hora,
+                  num_eventos,
+                  DATEDIFF(minute, evento_mais_antigo, lote_hora + INTERVAL '60 minutes') AS latencia_estimada_min
+                FROM lote_stats
+                ORDER BY lote_hora DESC;
+                ```
+
+                **Verificação:** Latência típica = 60 min (intervalo do cron) + 40 min (processamento) + 5 min (escrita) = **~105 min (p50)**. Registre o valor real.
+
+                ---
+
+                ## 7. Mapeie consumidores e suas expectativas de frescor
+
+                **Ação:** Identifique quem lê as tabelas do Forge, com que frequência e qual SLA de latência.
+
+                **Onde:** Repositórios de Sentinel, Cerebro, Pepper; logs de queries no DW.
+
+                **Procedimento:**
+
+                1. **Sentinel (tabelas agregadas):**
+
+                ```sql
+                -- Queries mais frequentes em Sentinel
+                SELECT 
+                  query_text,
+                  COUNT(*) AS num_execucoes,
+                  AVG(execution_time_ms) AS tempo_medio_ms,
+                  MAX(execution_time_ms) AS tempo_maximo_ms
+                FROM dw_query_log
+                WHERE user_app = 'sentinel'
+                  AND query_text LIKE '%forge_events_aggregated%'
+                  AND timestamp >= CURRENT_TIMESTAMP() - INTERVAL '7 days'
+                GROUP BY query_text
+                ORDER BY num_execucoes DESC
+                LIMIT 10;
+                ```
+
+                2. **Cerebro (índice de eventos transformados):**
+
+                ```bash
+                # Verifique logs de ingestão do Cerebro
+                grep -i "forge\|index" <cerebro-logs> | grep -E "ingested|indexed|latency" | tail -50
+                ```
+
+                3. **Pepper (relatórios de billing):**
+
+                ```bash
+                # Verifique agendamento e SLA
+                crontab -l | grep -i pepper
+                # ou
+                airflow dags list | grep -i pepper
+                airflow dag-details <pepper-dag-id>
+                ```
+
+                **Preencha a tabela:**
+
+                | Consumidor | Tabelas lidas | Frequência de leitura | Latência esperada (SLA) | Tipo de query | Criticidade |
+                |---|---|---|---|---|---|
+                | Sentinel | `forge_events_aggregated`, `forge_events_by_service` | A cada 30 s (dashboard) | < 5 min (p95) | Agregação em tempo real | Alta |
+                | Cerebro | `forge_events_raw` | A cada 60 s (indexação) | < 10 min | Scan sequencial | Alta |
+                | Pepper | `forge_events_aggregated`, `forge_sla_violations` | 1× por dia (02:00 UTC) | < 30 min | Relatório batch | Média |
+
+                **Verificação:** ≥3 consumidores mapeados; SLAs documentados.
+
+                ---
+
+                ## 8. Meça taxa de falha e impacto de falhas do lote atual
+
+                **Ação:** Quantifique frequência de falhas, causa raiz e impacto em cascata.
+
+                **Onde:** Logs de `forge-batch-ingest`, alertas, tickets de incidente.
+
+                **Comando/Configuração:**
+
+                ```bash
+                # Histórico de execuções (últimos 30 dias)
+                grep -E "forge-batch-ingest|FAILED|SUCCESS|ERROR" <scheduler-logs> \
+                  | grep -E "2024-01-[0-9]{2}" \
+                  | tail -100
+                ```
+
+                ```sql
+                -- Se há tabela de auditoria de jobs
+                SELECT 
+                  job_name,
+                  execution_date,
+                  status,
+                  error_message,
+                  duration_seconds,
+                  rows_processed,
+                  rows_failed
+                FROM job_execution_log
+                WHERE job_name = 'forge-batch-ingest'
+                  AND execution_date >= CURRENT_DATE - INTERVAL '30 days'
+                ORDER BY execution_date DESC;
+                ```
+
+                **Cálculos:**
+
+                ```python
+                total_runs = <número de execuções em 30 dias>
+                failed_runs = <número de falhas>
+                failure_rate = failed_runs / total_runs * 100
+
+                print(f"Taxa de falha: {failure_rate:.2f}%")
+                print(f"Falhas em 30 dias: {failed_runs}")
+                print(f"MTBF (Mean Time Between Failures): {30 * 24 * 60 / failed_runs:.1f} minutos")
+                ```
+
+                **Impacto de falha:**
+
+                ```sql
+                -- Verifique se um lote falhado causa atraso no próximo
+                SELECT 
+                  DATE_TRUNC('hour', execution_date) AS lote_hora,
+                  status,
+                  rows_processed,
+                  LAG(rows_processed) OVER (ORDER BY execution_date) AS rows_prev_lote,
+                  CASE 
+                    WHEN rows_processed > 2 * LAG(rows_processed) OVER (ORDER BY execution_date)
+                    THEN 'POSSÍVEL CATCH-UP'
+                    ELSE 'NORMAL'
+                  END AS observacao
+                FROM job_execution_log
+                WHERE job_name = 'forge-batch-ingest'
+                  AND execution_date >= CURRENT_DATE - INTERVAL '30 days'
+                ORDER BY execution_date DESC
+                LIMIT 50;
+                ```
+
+                **Preencha a tabela:**
+
+                | Métrica | Valor | Período |
+                |---|---|---|
+                | Total de execuções | ? | 30 dias |
+                | Execuções falhadas | ? | 30 dias |
+                | Taxa de falha | ? % | 30 dias |
+                | MTBF | ? min | 30 dias |
+                | Causa raiz mais comum | ? | (ex: timeout, OOM, deadlock) |
+                | Impacto: lotes com catch-up | ? % | 30 dias |
+                | Impacto: latência adicional por falha | ? min | (ex: +60 min se pula um lote) |
+
+                **Verificação:** Taxa de falha documentada; causa raiz identificada.
+
+                ---
+
+                ## 9. Calcule baseline de custo
+
+                **Ação:** Quantifique custo atual de computação, armazenamento e transferência de dados.
+
+                **Onde:** Fatura de cloud, console de custos, logs de billing.
+
+                **Comando/Configuração:**
+
+                ```bash
+                # AWS (se aplicável)
+                aws ce get-cost-and-usage \
+                  --time-period Start=2024-01-01,End=2024-01-31 \
+                  --granularity MONTHLY \
+                  --metrics "UnblendedCost" \
+                  --group-by Type=DIMENSION,Key=SERVICE \
+                  --filter file://filter.json
+
+                # GCP (se aplicável)
+                bq query --use_legacy_sql=false << 'EOF'
+                SELECT 
+                  service.description,
+                  SUM(cost) AS total_cost,
+                  SUM(usage.amount) AS total_usage
+                FROM `<project>.billing_export.gcp_billing_export_v1`
+                WHERE DATE(usage_start_time) >= '2024-01-01'
+                  AND DATE(usage_start_time) <= '2024-01-31'
+                GROUP BY service.description
+                ORDER BY total_cost DESC;
+                EOF
+                ```
+
+                **Cálculos:**
+
+                ```python
+                # Componentes de custo
+                spark_compute_cost_monthly = <valor em USD>
+                dw_storage_cost_monthly = <valor em USD>
+                dw_query_cost_monthly = <valor em USD>
+                relay_ingestion_cost_monthly = <valor em USD>
+
+                total_monthly = spark_compute_cost_monthly + dw_storage_cost_monthly + dw_query_cost_monthly + relay_ingestion_cost_monthly
+
+                print(f"Custo mensal do Forge:")
+                print(f"  Spark (compute): ${spark_compute_cost_monthly:,.2f}")
+                print(f"  DW (storage): ${dw_storage_cost_monthly:,.2f}")
+                print(f"  DW (queries): ${dw_query_cost_monthly:,.2f}")
+                print(f"  Relay (ingestion): ${relay_ingestion_cost_monthly:,.2f}")
+                print(f"  TOTAL: ${total_monthly:,.2f}")
+                print(f"  Custo por evento: ${total_monthly * 1e6 / (total_events_24h * 30):.6f}")
+                ```
+
+                **Preencha a tabela:**
+
+                | Componente | Custo mensal (USD) | % do total | Métrica de escala |
+                |---|---|---|---|
+                | Spark (compute) | ? | ? % | CPU-hours |
+                | DW (storage) | ? | ? % | GB-months |
+                | DW (queries) | ? | ? % | Bytes scanned |
+                | Relay (ingestion) | ? | ? % | GB ingested |
+                | **TOTAL** | **?** | **100%** | — |
+
+                **Verificação:** Custo total > $1k/mês (típico para SaaS de observabilidade).
+
+                ---
+
+                ## 10. Crie dashboard de baseline
+
+                **Ação:** Consolide todas as métricas em um dashboard para referência durante a migração.
+
+                **Onde:** Ferramenta de observabilidade (Grafana, Datadog, etc.).
+
+                **Procedimento:**
+
+                1. Crie um dashboard chamado `Forge Baseline — Etapa 1`.
+                2. Adicione painéis:
+
+                | Painel | Métrica | Query/Fórmula |
+                |---|---|---|
+                | Volume 24h | Eventos/dia | `rate(relay_messages_total[24h])` |
+                | Taxa média | Eventos/s | `avg_rate_events_per_sec` |
+                | Taxa pico | Eventos/s | `peak_rate_events_per_sec` |
+                | Latência p50 | Minutos | `histogram_quantile(0.5, latency_ms)` |
+                | Latência p95 | Minutos | `histogram_quantile(0.95, latency_ms)` |
+                | Taxa de falha | % | `(failed_runs / total_runs) * 100` |
+                | Tamanho DW | GB | `SUM(table_size_gb)` |
+                | Custo mensal | USD | `total_monthly_cost` |
+                | Tempo de processamento | Minutos | `spark_job_duration_seconds / 60` |
+
+                **Verificação:** Dashboard acessível e atualizado com dados reais.
+
+                ---
+
+                ## X. Ponto de não-retorno
+
+                **Não há ponto de não-retorno nesta etapa.** Todos os passos são de coleta de dados e documentação. Nenhuma mudança foi feita em produção.
+
+                ---
+
+                ## Y. Rollback
+
+                **Não aplicável.** Esta etapa não modifica nenhum sistema.
+
+                ---
+
+                ## Z. Critérios de conclusão
+
+                - [ ] **Relay:** Tópico/fila de entrada identificado; schema documentado; amostra de 100+ eventos coletada.
+                - [ ] **Volume:** Taxa média (evt/s), taxa pico (evt/s), tamanho médio (bytes), throughput (MB/s) documentados.
+                - [ ] **Transformações:** 14 etapas mapeadas com entrada, saída, tipo (sem estado/agregação/junção) e tempo de execução.
+                - [ ] **DW:** ≥3 tabelas inventariadas com schema, particionamento, tamanho (GB), linhas, taxa de crescimento (GB/dia).
+                - [ ] **Consumidores:** ≥3 consumidores mapeados (Sentinel, Cerebro, Pepper) com frequência de leitura e SLA de latência.
+                - [ ] **Latência:** Latência fim a fim (p50, p95) medida em minutos; baseline documentado.
+                - [ ] **Falhas:** Taxa de falha (%), MTBF, causa raiz e impacto de catch-up documentados.
+                - [ ] **Custo:** Custo mensal total (USD) e custo por evento documentados.
+                - [ ] **Dashboard:** Dashboard de baseline criado e acessível.
+                - [ ] **Suposições:** Todas as suposições marcadas com `[SUPOSIÇÃO]` e justificadas.
+                - [ ] **Dados faltantes:** Lista de dados que faltam para confirmar/derrubar escolhas futuras.
+
+                ---
+
+                ## W. Riscos e mitigação
+
+                | Risco | Probabilidade | Impacto | Mitigação |
+                |---|---|---|---|
+                | Dados de volume/latência inconsistentes entre fontes | Média | Médio | Validar com 2+ fontes independentes; reconciliar discrepâncias com time de Relay |
+                | Acesso negado a logs/métricas de consumidores | Baixa | Alto | Solicitar acesso com antecedência; envolver líderes técnicos de Sentinel, Cerebro, Pepper |
+                | Evento de teste não aparece no DW (falha de ingestão) | Baixa | Médio | Usar evento real em vez de injetado; verificar logs de erro do job |
+                | Tabelas do DW foram dropadas/renomeadas recentemente | Baixa | Médio | Consultar histórico de DDL; validar com time de DW |
+                | Custo mensal não está segregado por componente | Média | Baixo | Usar tags de billing; estimar proporção com base em logs de execução |
+                | Causa raiz de falhas não está documentada em logs | Média | Médio | Entrevistar time de on-call; revisar tickets de incidente |
+
+                ---
+
+                ## Dados faltantes e confirmações necessárias
+
+                ### Dados que faltam:
+
+                1. **Retenção no Relay:** Quantos dias/horas de eventos estão disponíveis no Relay? (Necessário para validar se catch-up é possível.)
+                2. **Tamanho de estado por tenant:** Qual é o maior tenant em termos de volume? (Necessário para dimensionar buffers em streaming.)
+                3. **Distribuição de latência:** Qual é a distribuição completa (p50, p75, p90, p95, p99) de latência? (Necessário para SLA de 2 min.)
+                4. **Configuração de retry:** Qual é a política de retry do job? (Necessário para entender impacto de falhas.)
+                5. **Dependências de junção:** Quais tabelas de lookup são usadas nas etapas 3, 7, 12? Qual é o tamanho e frequência de atualização? (Necessário para streaming.)
+                6. **SLA de Sentinel:** Qual é o SLA exato de latência para dashboards em tempo real? (Necessário para validar se 2 min é suficiente.)
+                7. **Custo de Relay:** Qual é o custo de manter dados no Relay por mais tempo (para replay)? (Necessário para trade-off de retenção.)
+
+                ### Confirmações que derrubariam/validariam escolhas futuras:
+
+                - Se **taxa de falha > 5%**, a migração para streaming é crítica (reduz impacto de falhas).
+                - Se **latência p95 > 120 min**, o SLA de 2 min é agressivo e requer validação com Sentinel.
+                - Se **custo de Spark > 50% do total**, otimizar transformações é prioritário.
+                - Se **tamanho de estado por tenant > 10 GB**, streaming com state store distribuído é necessário.
+                - Se **retenção no Relay < 24h**, replay de falhas é limitado; necessário buffer local.
+
+                ---
+
+                ## Suposições marcadas
+
+                | # | Suposição | Razão | Confirmação necessária |
+                |---|---|---|---|
+                | [SUPOSIÇÃO-1] | Relay é Kafka ou Pulsar | Padrão em arquiteturas de event streaming | Verificar tipo real de Relay |
+                | [SUPOSIÇÃO-2] | Volume é 1M–100M eventos/dia | Típico para SaaS de observabilidade | Coletar métrica real de `relay_messages_total` |
+                | [SUPOSIÇÃO-3] | Latência atual é ~105 min (60 min cron + 40 min Spark + 5 min escrita) | Baseado em descrição do problema | Medir com evento de teste |
+                | [SUPOSIÇÃO-4] | DW é Snowflake, BigQuery ou Redshift | Padrão em SaaS | Verificar tipo real de DW |
+                | [SUPOSIÇÃO-5] | Taxa de falha é 1–5% | Típico para jobs batch | Coletar histórico de 30 dias |
+                | [SUPOSIÇÃO-6] | Custo mensal é $5k–$50k | Baseado em volume e latência | Coletar fatura real |
+                | [SUPOSIÇÃO-7] | Sentinel lê a cada 30 s | Típico para dashboards em tempo real | Validar com time de Sentinel |
+                | [SUPOSIÇÃO-8] | Cerebro lê a cada 60 s | Típico para indexação contínua | Validar com time de Cerebro |
+                | [SUPOSIÇÃO-9] | Pepper roda uma vez por dia (02:00 UTC) | Típico para relatórios de billing | Validar com time de Pepper |
+
+                ---
+
+                ## Próximos passos (Etapa 2)
+
+                Após conclusão desta etapa, os dados coletados alimentarão:
+
+                - **Etapa 2:** Arquitetura de streaming (Kafka Streams, Flink, Spark Structured Streaming).
+                - **Etapa 3:** Prototipagem de um bloco de 30 s.
+                - **Etapa 4:** Validação de latência e custo do protótipo.
+                - **Etapa 5–10:** Migração gradual com canary, validação de consumidores, rollback.
+      INSUMO_ETAPA_2: |
+        # Etapa 2 de 10: Metas, SLOs e Critérios de Equivalência — Procedimento Técnico
+
+        ---
+
+        ## 0. Pré-requisitos
+
+        - [ ] Acesso de leitura ao repositório de SLAs e políticas da Aegis (ex: `aegis/docs/slas/`, Confluence, etc.)
+        - [ ] Acesso ao código-fonte de Sentinel, Cerebro e Pepper para entender semântica de leitura esperada
+        - [ ] Acesso a logs de queries e erros dos consumidores (últimos 30 dias)
+        - [ ] Contato técnico confirmado em cada time consumidor (Sentinel, Cerebro, Pepper) para validar SLAs herdados
+        - [ ] Acesso ao repositório de configuração do Forge para documentar SLOs propostos
+        - [ ] Ferramentas: editor de texto, SQL client, `git`, planilha colaborativa (para alinhamento com stakeholders)
+        - [ ] Resultado da Etapa 1 disponível: baseline de latência, volume, taxa de falha, consumidores mapeados
+        - [ ] Permissão para criar documentos de design (ADR — Architecture Decision Record) no repositório
+
+        ---
+
+        ## 1. Defina SLOs do novo Forge (frescor, completude, disponibilidade, recuperação)
+
+        **Ação:** Formalize os objetivos de nível de serviço para o Forge em streaming, baseado no objetivo de 2 min (p95) e nas necessidades dos consumidores.
+
+        **Onde:** Arquivo `forge/docs/slos.md` (novo ou atualizado) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 1.1 Frescor (Freshness)
+
+        **Definição:** Tempo máximo entre a chegada de um evento no Relay e sua disponibilidade para consulta no DW.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Frescor (Freshness)
+
+        ## Definição
+        Tempo decorrido desde a chegada de um evento no Relay até estar consultável 
+        (SELECT retorna resultado) em uma tabela do DW.
+
+        ## Métrica
+        - **Nome:** `forge_event_latency_p95_seconds`
+        - **Fórmula:** P95 de (timestamp_consultado_no_dw - timestamp_chegada_no_relay)
+        - **Granularidade:** Por tenant, por hora
+        - **Coleta:** Instrumentação no Relay (timestamp de entrada) e no Forge (timestamp de escrita no DW)
+
+        ## SLO
+        | Percentil | Latência alvo | Justificativa |
+        |-----------|---------------|---------------|
+        | p50       | 30 s          | Mediana: processamento rápido para dashboards |
+        | p95       | 120 s (2 min) | Alvo do projeto; suficiente para alertas em tempo real |
+        | p99       | 300 s (5 min) | Cauda: permite processamento de picos sem violar p95 |
+
+        ## Baseline (Etapa 1)
+        - p50: ~60 min (batch)
+        - p95: ~105 min (batch)
+        - p99: ~120 min (batch)
+
+        ## Melhoria esperada
+        - p95: 105 min → 2 min (52× mais rápido)
+        - Impacto: Sentinel pode atualizar dashboards a cada 30 s em vez de 60 min
+        ```
+
+        **Verificação:** Arquivo criado com SLO de frescor documentado; p95 = 120 s confirmado.
+
+        ---
+
+        ### 1.2 Completude (Completeness)
+
+        **Definição:** Percentual de eventos que chegam no Relay e são processados até o DW sem perda.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Completude (Completeness)
+
+        ## Definição
+        Percentual de eventos que chegam no Relay e aparecem no DW dentro do SLO de frescor.
+
+        ## Métrica
+        - **Nome:** `forge_completeness_percent`
+        - **Fórmula:** (eventos_no_dw / eventos_no_relay) * 100
+        - **Granularidade:** Por tenant, por hora
+        - **Coleta:** 
+          - Relay: contar mensagens consumidas (offset)
+          - DW: contar linhas inseridas (com deduplicação por event_id)
+
+        ## SLO
+        | Métrica | Alvo | Justificativa |
+        |---------|------|---------------|
+        | Completude geral | ≥ 99.9% | Perda < 0.1% é aceitável para observabilidade |
+        | Completude por tenant | ≥ 99.5% | Tenants pequenos podem ter variação maior |
+        | Completude por hora | ≥ 99.0% | Horas de pico podem ter reprocessamento |
+
+        ## Baseline (Etapa 1)
+        - Completude geral: ~99.5% (falhas causam perda de 1 lote = ~0.5%)
+        - Causa de perda: falhas de job, timeouts, deadlocks
+
+        ## Melhoria esperada
+        - Streaming com idempotência: ≥ 99.9% (reprocessamento automático sem perda)
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de completude; alvo ≥ 99.9% documentado.
+
+        ---
+
+        ### 1.3 Disponibilidade (Availability)
+
+        **Definição:** Percentual de tempo em que o Forge está processando eventos e os consumidores podem consultar dados atualizados.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Disponibilidade (Availability)
+
+        ## Definição
+        Percentual de tempo em que:
+        1. O Forge está consumindo eventos do Relay sem interrupção
+        2. O DW está aceitando escritas
+        3. Os consumidores podem executar queries sem erro
+
+        ## Métrica
+        - **Nome:** `forge_availability_percent`
+        - **Fórmula:** (tempo_sem_erro / tempo_total) * 100
+        - **Granularidade:** Por hora
+        - **Coleta:** Heartbeat do job de streaming; status de queries no DW
+
+        ## SLO
+        | Métrica | Alvo | Justificativa |
+        |---------|------|---------------|
+        | Disponibilidade geral | ≥ 99.5% | ~3.6 horas de downtime/mês aceitável |
+        | Disponibilidade de Relay | ≥ 99.9% | Relay é crítico; gerenciado por time separado |
+        | Disponibilidade de DW | ≥ 99.9% | DW é crítico; gerenciado por time separado |
+        | Disponibilidade do Forge | ≥ 99.0% | Forge pode falhar; recuperação automática esperada |
+
+        ## Baseline (Etapa 1)
+        - Disponibilidade: ~99.0% (taxa de falha ~1%, MTBF ~1440 min)
+        - Causa de indisponibilidade: falhas de job, OOM, timeouts
+
+        ## Melhoria esperada
+        - Streaming com auto-recovery: ≥ 99.5% (recuperação em < 5 min)
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de disponibilidade; alvo ≥ 99.5% documentado.
+
+        ---
+
+        ### 1.4 Tempo de Recuperação (Recovery Time Objective — RTO)
+
+        **Definição:** Tempo máximo para o Forge recuperar-se de uma falha e voltar a processar eventos.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Tempo de Recuperação (RTO — Recovery Time Objective)
+
+        ## Definição
+        Tempo decorrido desde a detecção de uma falha até o Forge voltar a processar 
+        eventos e reduzir o lag (atraso) para < 1 min.
+
+        ## Métrica
+        - **Nome:** `forge_recovery_time_seconds`
+        - **Fórmula:** timestamp_lag_reduzido - timestamp_falha_detectada
+        - **Granularidade:** Por incidente
+        - **Coleta:** Logs de job; métrica de lag do consumer group
+
+        ## SLO
+        | Cenário | RTO alvo | Justificativa |
+        |---------|----------|---------------|
+        | Falha de task (1 de N) | 30 s | Auto-restart rápido |
+        | Falha de job (todos os tasks) | 5 min | Redeploy + rebalance |
+        | Falha de DW (indisponibilidade) | 15 min | Fora do escopo do Forge; SLA do DW |
+        | Falha de Relay (indisponibilidade) | 15 min | Fora do escopo do Forge; SLA do Relay |
+
+        ## Baseline (Etapa 1)
+        - RTO atual: ~60 min (próximo lote batch)
+        - Causa: job falha, aguarda próximo agendamento
+
+        ## Melhoria esperada
+        - RTO: 60 min → 5 min (12× mais rápido)
+        - Impacto: Sentinel não fica sem dados por > 5 min
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de RTO; alvo ≤ 5 min documentado.
+
+        ---
+
+        ### 1.5 Objetivo de Ponto de Recuperação (RPO — Recovery Point Objective)
+
+        **Definição:** Quantidade máxima de dados que podem ser perdidos em caso de falha.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLO: Objetivo de Ponto de Recuperação (RPO — Recovery Point Objective)
+
+        ## Definição
+        Quantidade máxima de eventos que podem ser perdidos entre a última escrita 
+        bem-sucedida no DW e uma falha.
+
+        ## Métrica
+        - **Nome:** `forge_data_loss_events`
+        - **Fórmula:** eventos_no_buffer_nao_confirmados
+        - **Granularidade:** Por falha
+        - **Coleta:** Offset do consumer group; checkpoint do Forge
+
+        ## SLO
+        | Cenário | RPO alvo | Justificativa |
+        |---------|----------|---------------|
+        | Falha de task | 0 eventos | Streaming com checkpoint; sem perda |
+        | Falha de job | ≤ 30 s de eventos | Buffer em memória; reprocessamento automático |
+        | Falha de Relay | Fora do escopo | Relay gerencia sua própria retenção |
+
+        ## Baseline (Etapa 1)
+        - RPO atual: ~60 min de eventos (1 lote inteiro perdido se falha antes de escrita)
+        - Causa: batch sem checkpoint intermediário
+
+        ## Melhoria esperada
+        - RPO: 60 min → 0 eventos (streaming com checkpoint)
+        - Impacto: Nenhuma perda de dados; reprocessamento automático
+        ```
+
+        **Verificação:** Arquivo atualizado com SLO de RPO; alvo = 0 eventos documentado.
+
+        ---
+
+        ### 1.6 Consolidação de SLOs
+
+        **Ação:** Crie tabela consolidada de SLOs.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Tabela Consolidada de SLOs do Forge (Streaming)
+
+        | Dimensão | Métrica | Alvo | Baseline | Melhoria |
+        |----------|---------|------|----------|----------|
+        | **Frescor** | p50 latência | 30 s | 60 min | 120× |
+        | | p95 latência | 120 s | 105 min | 52× |
+        | | p99 latência | 300 s | 120 min | 24× |
+        | **Completude** | Completude geral | ≥ 99.9% | ~99.5% | +0.4% |
+        | | Completude por tenant | ≥ 99.5% | ~99.0% | +0.5% |
+        | **Disponibilidade** | Disponibilidade geral | ≥ 99.5% | ~99.0% | +0.5% |
+        | | Disponibilidade Forge | ≥ 99.0% | ~99.0% | — |
+        | **Recuperação** | RTO (falha de task) | 30 s | 60 min | 120× |
+        | | RTO (falha de job) | 5 min | 60 min | 12× |
+        | | RPO | 0 eventos | 60 min | ∞ |
+
+        ## Notas
+        - Frescor é a métrica mais crítica; impacta Sentinel (dashboards) e Cerebro (indexação).
+        - Completude é crítica para Pepper (billing); perda de dados = perda de receita.
+        - Disponibilidade é crítica para todos os consumidores; downtime = impacto em cascata.
+        - RTO é crítico para SLA de Sentinel; > 5 min viola SLA de latência.
+        ```
+
+        **Verificação:** Tabela consolidada criada; todos os SLOs documentados com alvo, baseline e melhoria esperada.
+
+        ---
+
+        ## 2. Defina semântica de entrega alvo e implicações por consumidor
+
+        **Ação:** Formalize a semântica de entrega (at-least-once, exactly-once, etc.) e mapeie implicações para cada consumidor.
+
+        **Onde:** Arquivo `forge/docs/delivery-semantics.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 2.1 Escolha da semântica de entrega
+
+        **Ação:** Analise trade-offs entre semânticas e escolha a mais apropriada.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Semântica de Entrega do Forge (Streaming)
+
+        ## Opções e Trade-offs
+
+        ### 1. At-Most-Once (AMO)
+        - **Definição:** Cada evento é processado 0 ou 1 vez.
+        - **Implementação:** Sem checkpoint; sem retry.
+        - **Vantagens:** Latência mínima; simplicidade.
+        - **Desvantagens:** Perda de dados em falhas; viola SLO de completude (99.9%).
+        - **Adequado para:** Métricas aproximadas (ex: amostragem).
+        - **Decisão:** ❌ REJEITADO — Completude é crítica para billing (Pepper).
+
+        ### 2. At-Least-Once (ALO)
+        - **Definição:** Cada evento é processado ≥ 1 vez.
+        - **Implementação:** Checkpoint + retry; sem deduplicação.
+        - **Vantagens:** Sem perda de dados; latência baixa; simples.
+        - **Desvantagens:** Duplicatas possíveis; requer idempotência no consumidor.
+        - **Adequado para:** Agregações (SUM, COUNT com deduplicação).
+        - **Decisão:** ✅ ACEITO — Semântica padrão com idempotência.
+
+        ### 3. Exactly-Once (EXO)
+        - **Definição:** Cada evento é processado exatamente 1 vez.
+        - **Implementação:** Checkpoint + transação atômica (Forge + DW).
+        - **Vantagens:** Sem duplicatas; sem perda.
+        - **Desvantagens:** Latência maior; complexidade (2-phase commit); custo.
+        - **Adequado para:** Billing, contabilidade.
+        - **Decisão:** ⚠️ CONDICIONAL — Usar apenas para tabelas críticas (ex: `forge_sla_violations`).
+
+        ## Semântica Escolhida: At-Least-Once com Idempotência
+
+        **Justificativa:**
+        - Completude ≥ 99.9% é alcançável com ALO + retry.
+        - Idempotência é simples: deduplicar por `event_id` no DW.
+        - Latência é baixa: sem overhead de 2-phase commit.
+        - Custo é menor: sem transações distribuídas.
+
+        **Implementação:**
+        1. Forge consome do Relay com checkpoint a cada 30 s.
+        2. Forge processa eventos em blocos de 30 s.
+        3. Forge escreve no DW com `INSERT ... ON CONFLICT DO NOTHING` (ou equivalente).
+        4. Se falha antes de checkpoint, reprocessa bloco (duplicatas possíveis).
+        5. Deduplicação no DW garante idempotência.
+
+        **Garantias:**
+        - ✅ Sem perda de dados (checkpoint + retry).
+        - ✅ Sem duplicatas visíveis (deduplicação no DW).
+        - ✅ Latência baixa (sem 2-phase commit).
+        - ✅ Custo baixo (sem transações distribuídas).
+        ```
+
+        **Verificação:** Arquivo criado com semântica ALO + idempotência escolhida e justificada.
+
+        ---
+
+        ### 2.2 Implicações por consumidor
+
+        **Ação:** Mapeie como cada consumidor deve lidar com a semântica ALO.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Implicações da Semântica At-Least-Once por Consumidor
+
+        ## 1. Sentinel (Dashboards e Alertas)
+
+        ### Expectativa atual (Batch)
+        - Dados chegam a cada 60 min.
+        - Sem duplicatas (batch é idempotente por natureza).
+        - Sem perda (falha = pula 1 lote, próximo lote processa o dobro).
+
+        ### Expectativa nova (Streaming ALO)
+        - Dados chegam a cada 30 s.
+        - Possíveis duplicatas em caso de reprocessamento (ex: 2 eventos com mesmo event_id).
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Sentinel
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Latência** | ↓ 52× (105 min → 2 min) | Atualizar SLA de dashboard de 5 min para 2 min |
+        | **Duplicatas** | Possíveis em reprocessamento | Queries devem usar `DISTINCT` ou `GROUP BY` com `MAX(timestamp)` |
+        | **Agregações** | SUM, COUNT podem ter +1 em reprocessamento | Usar `SUM(DISTINCT event_id)` ou deduplicar antes de agregar |
+        | **Alertas** | Podem disparar 2× se evento reprocessado | Adicionar deduplicação por `event_id` + `timestamp` em alertas |
+
+        ### Validação necessária
+        - [ ] Sentinel consegue lidar com duplicatas em queries?
+        - [ ] Alertas disparam corretamente com duplicatas?
+        - [ ] Dashboard atualiza a cada 30 s sem overhead?
+
+        ### Exemplo de query compatível
+        ```sql
+        -- ❌ ANTES (batch, sem duplicatas)
+        SELECT
+          tenant_id,
+          SUM(error_count) AS total_errors,
+          SUM(error_count) / SUM(request_count) AS error_rate
+        FROM forge_events_by_service
+        WHERE hour = DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+        GROUP BY tenant_id;
+
+        -- ✅ DEPOIS (streaming, com deduplicação)
+        SELECT
+          tenant_id,
+          SUM(error_count) AS total_errors,
+          SUM(error_count) / SUM(request_count) AS error_rate
+        FROM (
+          SELECT DISTINCT ON (event_id)
+            tenant_id,
+            error_count,
+            request_count,
+            timestamp
+          FROM forge_events_by_service
+          WHERE hour = DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+          ORDER BY event_id, timestamp DESC
+        ) dedup
+        GROUP BY tenant_id;
+        ```
+
+        ---
+
+        ## 2. Cerebro (Indexação de Logs)
+
+        ### Expectativa atual (Batch)
+        - Índice atualizado a cada 60 min.
+        - Sem duplicatas (batch é idempotente).
+        - Sem perda (falha = pula 1 lote).
+
+        ### Expectativa nova (Streaming ALO)
+        - Índice atualizado a cada 30 s.
+        - Possíveis duplicatas em caso de reprocessamento.
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Cerebro
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Latência** | ↓ 52× (105 min → 2 min) | Índice fica mais fresco; queries retornam dados mais recentes |
+        | **Duplicatas** | Possíveis em reprocessamento | Indexador deve deduplicar por `event_id` antes de indexar |
+        | **Tamanho do índice** | Pode crescer 2× se duplicatas não forem removidas | Implementar deduplicação no indexador |
+        | **Queries** | Podem retornar duplicatas se não deduplicadas | Queries devem usar `DISTINCT` ou filtro por `timestamp DESC` |
+
+        ### Validação necessária
+        - [ ] Cerebro consegue ingerir dados a cada 30 s?
+        - [ ] Deduplicação funciona corretamente?
+        - [ ] Tamanho do índice não explode?
+
+        ### Exemplo de ingestão compatível
+        ```python
+        # ❌ ANTES (batch, sem deduplicação)
+        def ingest_batch(events):
+            for event in events:
+                index.add(event)
+
+        # ✅ DEPOIS (streaming, com deduplicação)
+        def ingest_stream(events):
+            seen = set()
+            for event in events:
+                if event['event_id'] not in seen:
+                    index.add(event)
+                    seen.add(event['event_id'])
+        ```
+
+        ---
+
+        ## 3. Pepper (Billing)
+
+        ### Expectativa atual (Batch)
+        - Relatório de billing roda 1× por dia (02:00 UTC).
+        - Dados são finais (batch processou tudo).
+        - Sem duplicatas (batch é idempotente).
+        - Sem perda (falha = pula 1 lote, próximo lote processa o dobro).
+
+        ### Expectativa nova (Streaming ALO)
+        - Relatório de billing roda 1× por dia (02:00 UTC).
+        - Dados podem ter duplicatas até o momento da query.
+        - Sem perda (checkpoint + retry).
+
+        ### Implicações para Pepper
+        | Aspecto | Impacto | Ação necessária |
+        |--------|--------|-----------------|
+        | **Timing** | Relatório roda no mesmo horário (02:00 UTC) | Sem mudança; Pepper não é afetado por latência |
+        | **Duplicatas** | Possíveis até 02:00 UTC | Query de billing deve deduplicar por `event_id` |
+        | **Completude** | Crítica: perda de dados = perda de receita | Validar que completude ≥ 99.9% antes de cada relatório |
+        | **Reconciliação** | Pode ser necessária se duplicatas causarem overcharging | Implementar validação de duplicatas antes de faturar |
+
+        ### Validação necessária
+        - [ ] Query de billing deduplica corretamente?
+        - [ ] Completude é ≥ 99.9% no momento do relatório?
+        - [ ] Reconciliação detecta e corrige duplicatas?
+
+        ### Exemplo de query compatível
+        ```sql
+        -- ❌ ANTES (batch, sem deduplicação)
+        SELECT
+          tenant_id,
+          SUM(request_count) AS total_requests,
+          SUM(request_count) * 0.001 AS billing_amount_usd
+        FROM forge_events_aggregated
+        WHERE DATE(hour) = CURRENT_DATE - INTERVAL '1 day'
+        GROUP BY tenant_id;
+
+        -- ✅ DEPOIS (streaming, com deduplicação)
+        SELECT
+          tenant_id,
+          SUM(request_count) AS total_requests,
+          SUM(request_count) * 0.001 AS billing_amount_usd
+        FROM (
+          SELECT DISTINCT ON (event_id)
+            tenant_id,
+            request_count,
+            timestamp
+          FROM forge_events_aggregated
+          WHERE DATE(hour) = CURRENT_DATE - INTERVAL '1 day'
+          ORDER BY event_id, timestamp DESC
+        ) dedup
+        GROUP BY tenant_id;
+        ```
+
+        ---
+
+        ## Resumo de Implicações
+
+        | Consumidor | Semântica | Ação necessária | Risco | Mitigação |
+        |-----------|-----------|-----------------|-------|-----------|
+        | **Sentinel** | ALO | Deduplicar em queries; atualizar SLA | Duplicatas em alertas | Testar com reprocessamento |
+        | **Cerebro** | ALO | Deduplicar no indexador | Índice cresce 2× | Monitorar tamanho do índice |
+        | **Pepper** | ALO | Deduplicar em query de billing | Overcharging | Validar completude antes de faturar |
+
+        ```
+
+        **Verificação:** Arquivo criado com implicações por consumidor documentadas; ações necessárias listadas.
+
+        ---
+
+        ## 3. Defina critérios de equivalência: "streaming ≡ batch"
+
+        **Ação:** Formalize como validar que o Forge em streaming produz os mesmos resultados que o batch.
+
+        **Onde:** Arquivo `forge/docs/equivalence-criteria.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 3.1 Definição de equivalência
+
+        **Ação:** Defina o que significa "streaming é equivalente ao batch".
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Critérios de Equivalência: Streaming ≡ Batch
+
+        ## Definição
+        Streaming é equivalente ao batch se, para um período de tempo T:
+        1. Ambos processam o mesmo conjunto de eventos (completude).
+        2. Ambos produzem o mesmo resultado final (corretude).
+        3. Ambos produzem resultados no mesmo formato (schema).
+
+        ## Período de validação
+        - **Janela:** Últimas 24 horas (1 dia completo).
+        - **Granularidade:** Por hora (24 períodos de 1 hora).
+        - **Frequência:** Diária (após cada execução do batch).
+
+        ## Métricas de equivalência
+
+        ### 1. Completude (Row Count)
+        **Métrica:** Número de linhas em cada tabela.
+
+        **Fórmula:**
+        ```
+        completude = (linhas_streaming / linhas_batch) * 100
+        ```
+
+        **Alvo:**
+        - Completude ≥ 99.9% (diferença ≤ 0.1%)
+        - Diferença absoluta ≤ 0.1% das linhas por hora
+
+        **Exemplo:**
+        ```
+        Hora: 2024-01-15 10:00 UTC
+        Tabela: forge_events_aggregated
+        Linhas (batch): 1,000,000
+        Linhas (streaming): 999,900
+        Completude: 99.99% ✅ (diferença = 100 linhas = 0.01%)
+        ```
+
+        ### 2. Corretude (Value Comparison)
+        **Métrica:** Valores de agregações críticas.
+
+        **Fórmula:**
+        ```
+        corretude = (valores_streaming == valores_batch) ? 100% : 0%
+        ```
+
+        **Validação por tabela:**
+
+        #### Tabela: `forge_events_aggregated`
+        ```sql
+        -- Comparar SUM, COUNT, AVG, MIN, MAX por tenant/hora
+        SELECT
+          hour,
+          tenant_id,
+          SUM(request_count) AS sum_requests_batch,
+          COUNT(*) AS count_rows_batch,
+          AVG(error_rate) AS avg_error_rate_batch
+        FROM forge_events_aggregated_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id
+        ORDER BY hour, tenant_id;
+
+        -- Comparar com streaming
+        SELECT
+          hour,
+          tenant_id,
+          SUM(request_count) AS sum_requests_streaming,
+          COUNT(*) AS count_rows_streaming,
+          AVG(error_rate) AS avg_error_rate_streaming
+        FROM forge_events_aggregated_streaming
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id
+        ORDER BY hour, tenant_id;
+
+        -- Diferença
+        SELECT
+          b.hour,
+          b.tenant_id,
+          b.sum_requests_batch,
+          s.sum_requests_streaming,
+          ABS(b.sum_requests_batch - s.sum_requests_streaming) AS diff_sum,
+          CASE
+            WHEN ABS(b.sum_requests_batch - s.sum_requests_streaming) = 0 THEN '✅ OK'
+            ELSE '❌ MISMATCH'
+          END AS status
+        FROM batch_agg b
+        FULL OUTER JOIN streaming_agg s
+          ON b.hour = s.hour AND b.tenant_id = s.tenant_id
+        WHERE b.hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        ORDER BY b.hour, b.tenant_id;
+        ```
+
+        **Alvo:**
+        - Corretude = 100% (sem mismatches)
+        - Diferença absoluta ≤ 0.1% do valor
+
+        #### Tabela: `forge_events_by_service`
+        ```sql
+        -- Comparar error_count, error_rate por tenant/service/hora
+        SELECT
+          hour,
+          tenant_id,
+          service_id,
+          SUM(error_count) AS sum_errors_batch,
+          SUM(request_count) AS sum_requests_batch
+        FROM forge_events_by_service_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id, service_id
+        ORDER BY hour, tenant_id, service_id;
+
+        -- Comparar com streaming (mesmo padrão)
+        -- Validar que error_rate = error_count / request_count
+        ```
+
+        #### Tabela: `forge_sla_violations`
+        ```sql
+        -- Comparar SLA violations por tenant/service/hora
+        SELECT
+          hour,
+          tenant_id,
+          service_id,
+          COUNT(*) AS violations_batch,
+          SUM(CASE WHEN sla_breached THEN 1 ELSE 0 END) AS breached_batch
+        FROM forge_sla_violations_batch
+        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+        GROUP BY hour, tenant_id, service_id
+        ORDER BY hour, tenant_id, service_id;
+
+        -- Comparar com streaming (mesmo padrão)
+        ```
+
+        ### 3. Schema (Column Comparison)
+        **Métrica:** Estrutura das tabelas (colunas, tipos, ordem).
+
+        **Validação:**
+        ```sql
+        -- Comparar schema de batch vs streaming
+        SELECT
+          column_name,
+          data_type,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'forge_events_aggregated_batch'
+        ORDER BY ordinal_position;
+
+        SELECT
+          column_name,
+          data_type,
+          is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'forge_events_aggregated_streaming'
+        ORDER BY ordinal_position;
+
+        -- Diferença
+        SELECT
+          COALESCE(b.column_name, s.column_name) AS column_name,
+          b.data_type AS type_batch,
+          s.data_type AS type_streaming,
+          CASE
+            WHEN b.data_type = s.data_type THEN '✅ OK'
+            ELSE '❌ MISMATCH'
+          END AS status
+        FROM batch_schema b
+        FULL OUTER JOIN streaming_schema s
+          ON b.column_name = s.column_name
+        ORDER BY column_name;
+        ```
+
+        **Alvo:**
+        - Schema = 100% idêntico (mesmas colunas, tipos, ordem)
+
+        ## Resumo de Critérios
+
+        | Critério | Métrica | Alvo | Granularidade | Frequência |
+        |----------|---------|------|---------------|-----------|
+        | **Completude** | Linhas | ≥ 99.9% | Por hora | Diária |
+        | **Corretude** | Valores (SUM, COUNT, AVG) | 100% | Por tenant/hora | Diária |
+        | **Schema** | Colunas e tipos | 100% | Por tabela | Diária |
+        | **Latência** | p95 | ≤ 120 s | Por evento | Contínua |
+        | **Disponibilidade** | Uptime | ≥ 99.5% | Por hora | Contínua |
+
+        ```
+
+        **Verificação:** Arquivo criado com critérios de equivalência documentados; métricas e alvos definidos.
+
+        ---
+
+        ### 3.2 Implementação de validação
+
+        **Ação:** Crie script de validação que compara batch vs streaming.
+
+        **Onde:** Arquivo `forge/scripts/validate_equivalence.py` (novo) no repositório do Forge.
+
+        **Comando/Configuração:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Script de validação de equivalência: Streaming ≡ Batch
+
+        Compara resultados de Forge em streaming vs batch para as últimas 24 horas.
+        Gera relatório com métricas de completude, corretude e schema.
+        """
+
+        import sys
+        import json
+        from datetime import datetime, timedelta
+        from typing import Dict, List, Tuple
+        import logging
+
+        # [SUPOSIÇÃO] Usando Snowflake como DW; adaptar para BigQuery/Redshift conforme necessário
+        import snowflake.connector
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        class EquivalenceValidator:
+            def __init__(self, dw_connection_string: str):
+                """Inicializa conexão com DW."""
+                self.conn = snowflake.connector.connect(dw_connection_string)
+                self.cursor = self.conn.cursor()
+                self.report = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "period": "last_24_hours",
+                    "tables": {},
+                    "overall_status": "PASS",
+                    "errors": []
+                }
+
+            def validate_completeness(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming") -> Dict:
+                """Valida completude (row count) entre batch e streaming."""
+                logger.info(f"Validando completude: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Contar linhas no batch
+                    self.cursor.execute(f"""
+                        SELECT COUNT(*) AS row_count
+                        FROM {batch_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                    """)
+                    batch_count = self.cursor.fetchone()[0]
+                    
+                    # Contar linhas no streaming
+                    self.cursor.execute(f"""
+                        SELECT COUNT(*) AS row_count
+                        FROM {streaming_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                    """)
+                    streaming_count = self.cursor.fetchone()[0]
+                    
+                    # Calcular completude
+                    if batch_count == 0:
+                        completeness_pct = 100.0
+                        diff = 0
+                    else:
+                        completeness_pct = (streaming_count / batch_count) * 100
+                        diff = abs(batch_count - streaming_count)
+                    
+                    status = "PASS" if completeness_pct >= 99.9 else "FAIL"
+                    
+                    result = {
+                        "metric": "completeness",
+                        "batch_rows": batch_count,
+                        "streaming_rows": streaming_count,
+                        "completeness_pct": round(completeness_pct, 2),
+                        "diff_rows": diff,
+                        "diff_pct": round((diff / batch_count * 100) if batch_count > 0 else 0, 2),
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Completude: {completeness_pct:.2f}% ({diff} linhas de diferença)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar completude: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "completeness", "status": "ERROR", "error": str(e)}
+
+            def validate_correctness(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming", 
+                                    group_by_cols: List[str], agg_cols: Dict[str, str]) -> Dict:
+                """Valida corretude (valores de agregações) entre batch e streaming."""
+                logger.info(f"Validando corretude: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Construir query de agregação
+                    group_by_clause = ", ".join(group_by_cols)
+                    agg_clause_batch = ", ".join([f"{agg_func} AS {col}_{agg_func}" for col, agg_func in agg_cols.items()])
+                    agg_clause_streaming = ", ".join([f"{agg_func} AS {col}_{agg_func}" for col, agg_func in agg_cols.items()])
+                    
+                    # Query batch
+                    batch_query = f"""
+                        SELECT
+                          {group_by_clause},
+                          {agg_clause_batch}
+                        FROM {batch_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                        GROUP BY {group_by_clause}
+                        ORDER BY {group_by_clause}
+                    """
+                    
+                    # Query streaming
+                    streaming_query = f"""
+                        SELECT
+                          {group_by_clause},
+                          {agg_clause_streaming}
+                        FROM {streaming_table}
+                        WHERE hour >= CURRENT_TIMESTAMP() - INTERVAL '24 hours'
+                        GROUP BY {group_by_clause}
+                        ORDER BY {group_by_clause}
+                    """
+                    
+                    self.cursor.execute(batch_query)
+                    batch_rows = self.cursor.fetchall()
+                    
+                    self.cursor.execute(streaming_query)
+                    streaming_rows = self.cursor.fetchall()
+                    
+                    # Comparar
+                    mismatches = 0
+                    for batch_row, streaming_row in zip(batch_rows, streaming_rows):
+                        if batch_row != streaming_row:
+                            mismatches += 1
+                            logger.warning(f"  Mismatch: {batch_row} vs {streaming_row}")
+                    
+                    correctness_pct = ((len(batch_rows) - mismatches) / len(batch_rows) * 100) if batch_rows else 100.0
+                    status = "PASS" if correctness_pct == 100.0 else "FAIL"
+                    
+                    result = {
+                        "metric": "correctness",
+                        "batch_rows": len(batch_rows),
+                        "streaming_rows": len(streaming_rows),
+                        "mismatches": mismatches,
+                        "correctness_pct": round(correctness_pct, 2),
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Corretude: {correctness_pct:.2f}% ({mismatches} mismatches)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar corretude: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "correctness", "status": "ERROR", "error": str(e)}
+
+            def validate_schema(self, table_name: str, batch_suffix: "_batch", streaming_suffix: "_streaming") -> Dict:
+                """Valida schema (colunas e tipos) entre batch e streaming."""
+                logger.info(f"Validando schema: {table_name}")
+                
+                batch_table = f"{table_name}{batch_suffix}"
+                streaming_table = f"{table_name}{streaming_suffix}"
+                
+                try:
+                    # Obter schema batch
+                    self.cursor.execute(f"""
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_name = '{batch_table}'
+                        ORDER BY ordinal_position
+                    """)
+                    batch_schema = {row[0]: row[1] for row in self.cursor.fetchall()}
+                    
+                    # Obter schema streaming
+                    self.cursor.execute(f"""
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_name = '{streaming_table}'
+                        ORDER BY ordinal_position
+                    """)
+                    streaming_schema = {row[0]: row[1] for row in self.cursor.fetchall()}
+                    
+                    # Comparar
+                    mismatches = []
+                    for col, type_batch in batch_schema.items():
+                        type_streaming = streaming_schema.get(col)
+                        if type_streaming != type_batch:
+                            mismatches.append(f"{col}: {type_batch} vs {type_streaming}")
+                    
+                    for col in streaming_schema:
+                        if col not in batch_schema:
+                            mismatches.append(f"{col}: missing in batch")
+                    
+                    status = "PASS" if not mismatches else "FAIL"
+                    
+                    result = {
+                        "metric": "schema",
+                        "batch_columns": len(batch_schema),
+                        "streaming_columns": len(streaming_schema),
+                        "mismatches": mismatches,
+                        "status": status
+                    }
+                    
+                    logger.info(f"  Schema: {status} ({len(mismatches)} mismatches)")
+                    return result
+                    
+                except Exception as e:
+                    logger.error(f"  Erro ao validar schema: {e}")
+                    self.report["errors"].append(f"{table_name}: {str(e)}")
+                    return {"metric": "schema", "status": "ERROR", "error": str(e)}
+
+            def run_validation(self) -> Dict:
+                """Executa validação completa."""
+                logger.info("Iniciando validação de equivalência...")
+                
+                # Tabelas a validar
+                tables_config = {
+                    "forge_events_aggregated": {
+                        "group_by": ["hour", "tenant_id"],
+                        "agg": {"request_count": "SUM", "error_count": "SUM"}
+                    },
+                    "forge_events_by_service": {
+                        "group_by": ["hour", "tenant_id", "service_id"],
+                        "agg": {"error_count": "SUM", "request_count": "SUM"}
+                    },
+                    "forge_sla_violations": {
+                        "group_by": ["hour", "tenant_id", "service_id"],
+                        "agg": {"sla_breached": "SUM"}
+                    }
+                }
+                
+                for table_name, config in tables_config.items():
+                    logger.info(f"\nValidando tabela: {table_name}")
+                    
+                    table_report = {}
+                    
+                    # Completude
+                    completeness = self.validate_completeness(table_name, "_batch", "_streaming")
+                    table_report["completeness"] = completeness
+                    
+                    # Corretude
+                    correctness = self.validate_correctness(
+                        table_name, "_batch", "_streaming",
+                        config["group_by"], config["agg"]
+                    )
+                    table_report["correctness"] = correctness
+                    
+                    # Schema
+                    schema = self.validate_schema(table_name, "_batch", "_streaming")
+                    table_report["schema"] = schema
+                    
+                    # Status da tabela
+                    table_status = "PASS" if all(
+                        v.get("status") == "PASS" for v in table_report.values()
+                    ) else "FAIL"
+                    table_report["status"] = table_status
+                    
+                    self.report["tables"][table_name] = table_report
+                    
+                    if table_status == "FAIL":
+                        self.report["overall_status"] = "FAIL"
+                
+                logger.info("\nValidação concluída.")
+                return self.report
+
+            def save_report(self, output_file: str):
+                """Salva relatório em arquivo JSON."""
+                with open(output_file, "w") as f:
+                    json.dump(self.report, f, indent=2)
+                logger.info(f"Relatório salvo em: {output_file}")
+
+            def print_summary(self):
+                """Imprime resumo do relatório."""
+                print("\n" + "="*80)
+                print("RELATÓRIO DE EQUIVALÊNCIA: STREAMING ≡ BATCH")
+                print("="*80)
+                print(f"Timestamp: {self.report['timestamp']}")
+                print(f"Período: {self.report['period']}")
+                print(f"Status geral: {self.report['overall_status']}")
+                print()
+                
+                for table_name, table_report in self.report["tables"].items():
+                    print(f"Tabela: {table_name}")
+                    print(f"  Status: {table_report['status']}")
+                    print(f"  Completude: {table_report['completeness']['completeness_pct']}% "
+                          f"({table_report['completeness']['diff_rows']} linhas de diferença)")
+                    print(f"  Corretude: {table_report['correctness']['correctness_pct']}% "
+                          f"({table_report['correctness']['mismatches']} mismatches)")
+                    print(f"  Schema: {table_report['schema']['status']} "
+                          f"({len(table_report['schema']['mismatches'])} mismatches)")
+                    print()
+                
+                if self.report["errors"]:
+                    print("Erros:")
+                    for error in self.report["errors"]:
+                        print(f"  - {error}")
+                
+                print("="*80)
+
+        if __name__ == "__main__":
+            # [SUPOSIÇÃO] Conexão com DW via variável de ambiente
+            dw_conn_string = os.getenv("DW_CONNECTION_STRING")
+            if not dw_conn_string:
+                print("Erro: DW_CONNECTION_STRING não definida")
+                sys.exit(1)
+            
+            validator = EquivalenceValidator(dw_conn_string)
+            report = validator.run_validation()
+            
+            # Salvar relatório
+            output_file = f"equivalence_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            validator.save_report(output_file)
+            
+            # Imprimir resumo
+            validator.print_summary()
+            
+            # Retornar código de saída
+            sys.exit(0 if report["overall_status"] == "PASS" else 1)
+        ```
+
+        **Verificação:** Script criado e testável; gera relatório JSON com métricas de equivalência.
+
+        ---
+
+        ## 4. Defina orçamento de erro e gatilho de rollback
+
+        **Ação:** Formalize limites de erro aceitáveis e condições que disparam rollback automático.
+
+        **Onde:** Arquivo `forge/docs/error-budget-and-rollback.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 4.1 Orçamento de erro
+
+        **Ação:** Defina quanto de erro é aceitável antes de rollback.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Orçamento de Erro e Gatilho de Rollback
+
+        ## Orçamento de Erro (Error Budget)
+
+        ### Definição
+        Quantidade máxima de erro aceitável em uma métrica antes de disparar rollback.
+
+        ### Métricas e Orçamentos
+
+        #### 1. Completude (Completeness Error Budget)
+        **Métrica:** Percentual de eventos perdidos.
+
+        **Orçamento:**
+        ```
+        Alvo: ≥ 99.9% completude
+        Orçamento: ≤ 0.1% perda
+        Período: Por hora
+        Gatilho: Se completude < 99.9% em 2 horas consecutivas
+        ```
+
+        **Cálculo:**
+        ```python
+        completude_hora_1 = 99.85%  # ❌ Abaixo do alvo
+        completude_hora_2 = 99.88%  # ❌ Abaixo do alvo (2 consecutivas)
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 2. Corretude (Correctness Error Budget)
+        **Métrica:** Percentual de linhas com valores incorretos.
+
+        **Orçamento:**
+        ```
+        Alvo: 100% corretude
+        Orçamento: ≤ 0.1% de mismatches
+        Período: Por hora
+        Gatilho: Se corretude < 99.9% em 1 hora
+        ```
+
+        **Cálculo:**
+        ```python
+        mismatches_hora_1 = 150  # em 1M linhas = 0.015%
+        corretude = 99.985%  # ✅ Acima do alvo
+        # → Sem gatilho
+
+        mismatches_hora_2 = 2000  # em 1M linhas = 0.2%
+        corretude = 99.8%  # ❌ Abaixo do alvo
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 3. Latência (Latency Error Budget)
+        **Métrica:** Percentual de eventos que violam SLO de latência.
+
+        **Orçamento:**
+        ```
+        Alvo: p95 ≤ 120 s
+        Orçamento: ≤ 5% de eventos com latência > 120 s
+        Período: Por hora
+        Gatilho: Se > 5% de eventos violam SLO em 1 hora
+        ```
+
+        **Cálculo:**
+        ```python
+        eventos_hora_1 = 100000
+        eventos_violando_slo = 3000  # 3%
+        violacao_pct = 3%  # ✅ Abaixo do orçamento
+        # → Sem gatilho
+
+        eventos_hora_2 = 100000
+        eventos_violando_slo = 7000  # 7%
+        violacao_pct = 7%  # ❌ Acima do orçamento
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        #### 4. Disponibilidade (Availability Error Budget)
+        **Métrica:** Percentual de tempo com erro.
+
+        **Orçamento:**
+        ```
+        Alvo: ≥ 99.5% disponibilidade
+        Orçamento: ≤ 0.5% downtime
+        Período: Por dia
+        Gatilho: Se disponibilidade < 99.0% em 1 dia
+        ```
+
+        **Cálculo:**
+        ```python
+        uptime_dia_1 = 99.2%  # ✅ Acima do alvo
+        # → Sem gatilho
+
+        uptime_dia_2 = 98.8%  # ❌ Abaixo do alvo
+        # → GATILHO ACIONADO: Rollback para batch
+        ```
+
+        ### Resumo de Orçamentos
+
+        | Métrica | Alvo | Orçamento | Período | Gatilho |
+        |---------|------|----------|---------|---------|
+        | **Completude** | ≥ 99.9% | ≤ 0.1% perda | Por hora | < 99.9% em 2h consecutivas |
+        | **Corretude** | 100% | ≤ 0.1% mismatches | Por hora | < 99.9% em 1h |
+        | **Latência (p95)** | ≤ 120 s | ≤ 5% violação | Por hora | > 5% violação em 1h |
+        | **Disponibilidade** | ≥ 99.5% | ≤ 0.5% downtime | Por dia | < 99.0% em 1 dia |
+
+        ```
+
+        **Verificação:** Arquivo criado com orçamentos de erro documentados; gatilhos definidos.
+
+        ---
+
+        ### 4.2 Gatilho de rollback
+
+        **Ação:** Defina condições que disparam rollback automático.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # Gatilhos de Rollback
+
+        ## Definição
+        Condições que, quando acionadas, disparam rollback automático do Forge de streaming para batch.
+
+        ## Gatilhos Automáticos
+
+        ### Gatilho 1: Completude Crítica
+        **Condição:** Completude < 99.9% em 2 horas consecutivas.
+
+        **Ação:**
+        1. Alertar time de on-call (Slack, PagerDuty).
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        # Pseudocódigo de monitoramento
+        def check_completeness_trigger():
+            completeness_last_2h = get_completeness_last_2_hours()
+            if all(c < 99.9 for c in completeness_last_2h):
+                alert("COMPLETENESS_CRITICAL", completeness_last_2h)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("COMPLETENESS_CRITICAL")
+        ```
+
+        ### Gatilho 2: Corretude Crítica
+        **Condição:** Corretude < 99.9% em 1 hora.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_correctness_trigger():
+            correctness_last_1h = get_correctness_last_hour()
+            if correctness_last_1h < 99.9:
+                alert("CORRECTNESS_CRITICAL", correctness_last_1h)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("CORRECTNESS_CRITICAL")
+        ```
+
+        ### Gatilho 3: Latência Crítica
+        **Condição:** > 5% de eventos com latência > 120 s em 1 hora.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 10 min para confirmação manual (latência pode ser transitória).
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_latency_trigger():
+            latency_violation_pct = get_latency_violation_pct_last_hour()
+            if latency_violation_pct > 5:
+                alert("LATENCY_CRITICAL", latency_violation_pct)
+                if not manual_override_within(minutes=10):
+                    trigger_rollback("LATENCY_CRITICAL")
+        ```
+
+        ### Gatilho 4: Disponibilidade Crítica
+        **Condição:** Disponibilidade < 99.0% em 1 dia.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 15 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_availability_trigger():
+            availability_last_24h = get_availability_last_24_hours()
+            if availability_last_24h < 99.0:
+                alert("AVAILABILITY_CRITICAL", availability_last_24h)
+                if not manual_override_within(minutes=15):
+                    trigger_rollback("AVAILABILITY_CRITICAL")
+        ```
+
+        ### Gatilho 5: Erro de Consumidor
+        **Condição:** Consumidor (Sentinel, Cerebro, Pepper) reporta erro ao ler dados do Forge.
+
+        **Ação:**
+        1. Alertar time de on-call.
+        2. Aguardar 5 min para confirmação manual.
+        3. Se não confirmado, executar rollback automático.
+
+        **Implementação:**
+        ```python
+        def check_consumer_error_trigger():
+            consumer_errors = get_consumer_errors_last_hour()
+            if consumer_errors > 0:
+                alert("CONSUMER_ERROR", consumer_errors)
+                if not manual_override_within(minutes=5):
+                    trigger_rollback("CONSUMER_ERROR")
+        ```
+
+        ## Gatilhos Manuais
+
+        ### Gatilho Manual 1: Decisão de Negócio
+        **Condição:** Time de produto/engenharia decide que streaming não é viável.
+
+        **Ação:**
+        1. Executar rollback imediatamente.
+        2. Documentar razão em ticket.
+
+        ### Gatilho Manual 2: Incidente Crítico
+        **Condição:** Incidente crítico em produção (ex: perda de dados, corrupção).
+
+        **Ação:**
+        1. Executar rollback imediatamente.
+        2. Investigar causa raiz.
+
+        ## Resumo de Gatilhos
+
+        | Gatilho | Condição | Ação | Tempo de confirmação |
+        |---------|----------|------|----------------------|
+        | **Completude** | < 99.9% em 2h | Rollback automático | 5 min |
+        | **Corretude** | < 99.9% em 1h | Rollback automático | 5 min |
+        | **Latência** | > 5% violação em 1h | Rollback automático | 10 min |
+        | **Disponibilidade** | < 99.0% em 1 dia | Rollback automático | 15 min |
+        | **Erro de consumidor** | Erro ao ler dados | Rollback automático | 5 min |
+        | **Decisão de negócio** | Time decide | Rollback imediato | — |
+        | **Incidente crítico** | Perda/corrupção de dados | Rollback imediato | — |
+
+        ```
+
+        **Verificação:** Arquivo criado com gatilhos de rollback documentados; ações e tempos definidos.
+
+        ---
+
+        ## 5. Mapeie SLAs herdados que não podem ser quebrados
+
+        **Ação:** Identifique e formalize SLAs de consumidores que devem ser mantidos durante a migração.
+
+        **Onde:** Arquivo `forge/docs/inherited-slas.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 5.1 Coleta de SLAs herdados
+
+        **Ação:** Entreviste times de consumidores para confirmar SLAs.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # SLAs Herdados: Restrições que Não Podem Ser Quebradas
+
+        ## Definição
+        SLAs herdados são compromissos de nível de serviço que o Forge deve manter 
+        durante a migração de batch para streaming.
+
+        ## SLAs por Consumidor
+
+        ### 1. Sentinel (Dashboards e Alertas)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Dados disponíveis a cada 60 min
+        Disponibilidade: 99.0% (uptime)
+        Completude: 99.5% (sem perda de dados)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Dados disponíveis a cada 30 s (SLA de 2 min p95)
+        Disponibilidade: 99.5% (uptime) — AUMENTADO
+        Completude: 99.9% (sem perda de dados) — AUMENTADO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Dashboards ficam desatualizados.
+        - Alertas não disparam no tempo correto.
+        - Clientes não conseguem monitorar aplicações em tempo real.
+        - **Severidade:** CRÍTICA
+
+        #### Validação necessária
+        - [ ] Sentinel consegue processar dados a cada 30 s?
+        - [ ] Alertas disparam corretamente com latência de 2 min?
+        - [ ] Dashboard não fica sobrecarregado com atualizações frequentes?
+
+        ---
+
+        ### 2. Cerebro (Indexação de Logs)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Índice atualizado a cada 60 min
+        Disponibilidade: 99.0% (uptime)
+        Completude: 99.5% (sem perda de eventos)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Índice atualizado a cada 30 s (SLA de 2 min p95)
+        Disponibilidade: 99.5% (uptime) — AUMENTADO
+        Completude: 99.9% (sem perda de eventos) — AUMENTADO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Logs não aparecem em buscas em tempo real.
+        - Investigação de incidentes fica mais lenta.
+        - Clientes não conseguem debugar problemas rapidamente.
+        - **Severidade:** ALTA
+
+        #### Validação necessária
+        - [ ] Cerebro consegue ingerir dados a cada 30 s?
+        - [ ] Índice não fica fragmentado com atualizações frequentes?
+        - [ ] Queries de busca não ficam mais lentas?
+
+        ---
+
+        ### 3. Pepper (Billing)
+
+        #### SLA Atual (Batch)
+        ```
+        Latência: Relatório roda 1× por dia (02:00 UTC)
+        Disponibilidade: 99.9% (uptime)
+        Completude: 99.9% (sem perda de eventos = sem perda de receita)
+        Precisão: 100% (sem duplicatas, sem undercharging/overcharging)
+        ```
+
+        #### SLA Herdado (Streaming)
+        ```
+        Latência: Relatório roda 1× por dia (02:00 UTC) — SEM MUDANÇA
+        Disponibilidade: 99.9% (uptime) — MANTIDO
+        Completude: 99.9% (sem perda de eventos) — MANTIDO
+        Precisão: 100% (sem duplicatas, sem undercharging/overcharging) — CRÍTICO
+        ```
+
+        #### Impacto se SLA for quebrado
+        - Clientes são faturados incorretamente (overcharging) ou não faturados (undercharging).
+        - Perda de receita ou disputa com clientes.
+        - Conformidade regulatória em risco.
+        - **Severidade:** CRÍTICA
+
+        #### Validação necessária
+        - [ ] Query de billing deduplica corretamente?
+        - [ ] Completude é ≥ 99.9% no momento do relatório (02:00 UTC)?
+        - [ ] Reconciliação detecta e corrige duplicatas?
+        - [ ] Teste de billing com dados reais antes de produção?
+
+        ---
+
+        ## Resumo de SLAs Herdados
+
+        | Consumidor | Métrica | SLA Atual | SLA Herdado | Mudança | Severidade |
+        |-----------|---------|-----------|------------|---------|-----------|
+        | **Sentinel** | Latência | 60 min | 2 min (p95) | ↓ 30× | CRÍTICA |
+        | | Disponibilidade | 99.0% | 99.5% | ↑ 0.5% | ALTA |
+        | | Completude | 99.5% | 99.9% | ↑ 0.4% | ALTA |
+        | **Cerebro** | Latência | 60 min | 2 min (p95) | ↓ 30× | ALTA |
+        | | Disponibilidade | 99.0% | 99.5% | ↑ 0.5% | ALTA |
+        | | Completude | 99.5% | 99.9% | ↑ 0.4% | ALTA |
+        | **Pepper** | Latência | 60 min | 60 min | — | — |
+        | | Disponibilidade | 99.9% | 99.9% | — | CRÍTICA |
+        | | Completude | 99.9% | 99.9% | — | CRÍTICA |
+        | | Precisão | 100% | 100% | — | CRÍTICA |
+
+        ## Validação de SLAs Herdados
+
+        ### Checklist de Validação
+
+        - [ ] **Sentinel**
+          - [ ] Consegue processar dados a cada 30 s?
+          - [ ] Alertas disparam corretamente com latência de 2 min?
+          - [ ] Dashboard não fica sobrecarregado?
+          - [ ] Queries de agregação lidam com duplicatas?
+
+        - [ ] **Cerebro**
+          - [ ] Consegue ingerir dados a cada 30 s?
+          - [ ] Índice não fica fragmentado?
+          - [ ] Queries de busca não ficam mais lentas?
+          - [ ] Deduplicação funciona corretamente?
+
+        - [ ] **Pepper**
+          - [ ] Query de billing deduplica corretamente?
+          - [ ] Completude é ≥ 99.9% no momento do relatório?
+          - [ ] Reconciliação detecta duplicatas?
+          - [ ] Teste de billing com dados reais passou?
+
+        ### Teste de Regressão
+
+        Antes de cada etapa de migração, executar:
+
+        ```bash
+        # Teste de Sentinel
+        ./tests/test_sentinel_compatibility.sh
+
+        # Teste de Cerebro
+        ./tests/test_cerebro_compatibility.sh
+
+        # Teste de Pepper
+        ./tests/test_pepper_billing_accuracy.sh
+        ```
+
+        ```
+
+        **Verificação:** Arquivo criado com SLAs herdados documentados; validações listadas.
+
+        ---
+
+        ### 5.2 Validação de SLAs herdados com consumidores
+
+        **Ação:** Confirme SLAs com times de consumidores.
+
+        **Comando/Configuração:**
+
+        ```bash
+        #!/bin/bash
+        # Script de validação de SLAs herdados com consumidores
+
+        echo "=== Validação de SLAs Herdados ==="
+        echo ""
+
+        # Sentinel
+        echo "1. Sentinel (Dashboards e Alertas)"
+        echo "   Contato: [SUPOSIÇÃO] slack #sentinel-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência esperado para dashboards?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Conseguem lidar com dados a cada 30 s?"
+        echo "   - Conseguem lidar com possíveis duplicatas?"
+        echo ""
+
+        # Cerebro
+        echo "2. Cerebro (Indexação de Logs)"
+        echo "   Contato: [SUPOSIÇÃO] slack #cerebro-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência esperado para indexação?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Conseguem ingerir dados a cada 30 s?"
+        echo "   - Conseguem lidar com possíveis duplicatas?"
+        echo ""
+
+        # Pepper
+        echo "3. Pepper (Billing)"
+        echo "   Contato: [SUPOSIÇÃO] slack #pepper-team"
+        echo "   Questões:"
+        echo "   - Qual é o SLA de latência para relatório de billing?"
+        echo "   - Qual é o SLA de disponibilidade?"
+        echo "   - Qual é o SLA de completude?"
+        echo "   - Qual é o SLA de precisão (sem duplicatas)?"
+        echo "   - Conseguem validar dados antes de faturar?"
+        echo ""
+
+        echo "=== Próximos passos ==="
+        echo "1. Enviar questionário para cada time consumidor."
+        echo "2. Agendar reunião de alinhamento."
+        echo "3. Documentar respostas em forge/docs/inherited-slas.md."
+        echo "4. Criar testes de regressão para cada SLA."
+        ```
+
+        **Verificação:** Script criado; questionário enviado para consumidores.
+
+        ---
+
+        ## 6. Crie documento de decisão arquitetural (ADR)
+
+        **Ação:** Formalize todas as decisões de SLOs, semântica e equivalência em um ADR.
+
+        **Onde:** Arquivo `forge/docs/adr/0002-streaming-slos-and-semantics.md` (novo) no repositório do Forge.
+
+        **Comando/Configuração:**
+
+        ```markdown
+        # ADR 0002: SLOs, Semântica de Entrega e Critérios de Equivalência para Forge Streaming
+
+        ## Status
+        PROPOSED (aguardando aprovação de stakeholders)
+
+        ## Contexto
+        O Forge está migrando de batch (60 min) para streaming (30 s) para reduzir latência de observabilidade.
+        Precisamos formalizar SLOs, semântica de entrega e critérios de equivalência para validar que 
+        streaming é seguro e equivalente ao batch.
+
+        ## Decisão
+
+        ### 1. SLOs do Forge Streaming
+        - **Frescor (p95):** 120 s (2 min) — 52× mais rápido que batch
+        - **Completude:** ≥ 99.9% — sem perda de dados
+        - **Disponibilidade:** ≥ 99.5% — ~3.6 horas de downtime/mês
+        - **RTO (falha de job):** ≤ 5 min — recuperação rápida
+        - **RPO:** 0 eventos — sem perda de dados
+
+        ### 2. Semântica de Entrega
+        - **Escolhida:** At-Least-Once (ALO) com idempotência
+        - **Justificativa:** Completude ≥ 99.9%, latência baixa, custo baixo
+        - **Implementação:** Checkpoint a cada 30 s + deduplicação no DW
+
+        ### 3. Critérios de Equivalência
+        - **Completude:** ≥ 99.9% (diferença ≤ 0.1% das linhas por hora)
+        - **Corretude:** 100% (sem mismatches em agregações)
+        - **Schema:** 100% idêntico (mesmas colunas, tipos, ordem)
+        - **Validação:** Diária, comparando batch vs streaming das últimas 24 horas
+
+        ### 4. Orçamento de Erro
+        - **Completude:** ≤ 0.1% perda → Gatilho se < 99.9% em 2h consecutivas
+        - **Corretude:** ≤ 0.1% mismatches → Gatilho se < 99.9% em 1h
+        - **Latência:** ≤ 5% violação → Gatilho se > 5% violação em 1h
+        - **Disponibilidade:** ≤ 0.5% downtime → Gatilho se < 99.0% em 1 dia
+
+        ### 5. Gatilhos de Rollback
+        - **Automático:** Completude, corretude, latência, disponibilidade críticas
+        - **Manual:** Decisão de negócio, incidente crítico
+        - **Tempo de confirmação:** 5–15 min antes de rollback automático
+
+        ### 6. SLAs Herdados
+        - **Sentinel:** Latência 2 min (p95), disponibilidade 99.5%, completude 99.9%
+        - **Cerebro:** Latência 2 min (p95), disponibilidade 99.5%, completude 99.9%
+        - **Pepper:** Latência 60 min (sem mudança), disponibilidade 99.9%, completude 99.9%, precisão 100%
+
+        ## Consequências
+
+        ### Positivas
+        - ✅ Latência reduzida 52× (105 min → 2 min)
+        - ✅ Completude aumentada (99.5% → 99.9%)
+        - ✅ Disponibilidade aumentada (99.0% → 99.5%)
+        - ✅ Recuperação mais rápida (60 min → 5 min)
+        - ✅ Sem perda de dados (RPO = 0)
+
+        ### Negativas
+        - ❌ Complexidade aumentada (streaming vs batch)
+        - ❌ Possíveis duplicatas em reprocessamento (mitigado com idempotência)
+        - ❌ Custo de operação pode aumentar (monitoramento, alertas)
+        - ❌ Consumidores precisam lidar com duplicatas
+
+        ### Mitigações
+        - Implementar deduplicação no DW (INSERT ... ON CONFLICT DO NOTHING)
+        - Validação diária de equivalência (script automatizado)
+        - Gatilhos automáticos de rollback (sem intervenção manual)
+        - Testes de regressão com consumidores (Sentinel, Cerebro, Pepper)
+
+        ## Aprovação Necessária
+        - [ ] Tech Lead do Forge
+        - [ ] Tech Lead de Sentinel
+        - [ ] Tech Lead de Cerebro
+        - [ ] Tech Lead de Pepper
+        - [ ] VP de Engenharia
+
+        ## Referências
+        - Etapa 1: Inventário e Baseline
+        - Etapa 2: Metas, SLOs e Critérios de Equivalência (este documento)
+        - Etapa 3: Arquitetura de Streaming
+        ```
+
+        **Verificação:** ADR criado; pronto para revisão e aprovação.
+
+        ---
+
+        ## X. Ponto de não-retorno
+
+        **Não há ponto de não-retorno nesta etapa.** Todos os passos são de documentação e formalização de decisões.
+
+        Nenhuma mudança foi feita em produção. Todas as decisões podem ser revisadas e alteradas antes da Etapa 3 (prototipagem).
+
+        ---
+
+        ## Y. Rollback
+
+        **Não aplicável.** Esta etapa não modifica nenhum sistema.
+
+        ---
+
+        ## Z. Critérios de conclusão
+
+        - [ ] **SLOs:** Frescor (p95 = 120 s), completude (≥ 99.9%), disponibilidade (≥ 99.5%), RTO (≤ 5 min), RPO (0 eventos) documentados.
+        - [ ] **Semântica:** At-Least-Once com idempotência escolhida e justificada; implicações por consumidor documentadas.
+        - [ ] **Equivalência:** Critérios de completude (≥ 99.9%), corretude (100%), schema (100%) definidos; script de validação criado.
+        - [ ] **Orçamento de erro:** Limites de erro (completude, corretude, latência, disponibilidade) documentados; gatilhos definidos.
+        - [ ] **Gatilhos de rollback:** Automáticos (5 gatilhos) e manuais (2 gatilhos) documentados; tempos de confirmação definidos.
+        - [ ] **SLAs herdados:** Sentinel, Cerebro, Pepper mapeados; validações listadas; confirmação com consumidores iniciada.
+        - [ ] **ADR:** Documento de decisão arquitetural criado; pronto para aprovação.
+        - [ ] **Suposições:** Todas as suposições marcadas com `[SUPOSIÇÃO]` e justificadas.
+        - [ ] **Dados faltantes:** Lista de dados que faltam para confirmar/derrubar escolhas futuras.
+
+        ---
+
+        ## W. Riscos e mitigação
+
+        | Risco | Probabilidade | Impacto | Mitigação |
+        |-------|---------------|--------|-----------|
+        | SLOs são muito agressivos (2 min p95 não é alcançável) | Média | Alto | Validar com protótipo (Etapa 3); ajustar SLOs se necessário |
+        | Consumidores não conseguem lidar com duplicatas | Média | Alto | Testar com dados reais; implementar deduplicação em consumidores |
+        | Orçamento de erro é muito restritivo (gatilhos disparam frequentemente) | Média | Médio | Ajustar orçamentos após prototipagem; validar com dados históricos |
+        | SLAs herdados não são confirmados com consumidores | Baixa | Alto | Enviar questionário agora; agendar reunião de alinhamento |
+        | Gatilhos de rollback não funcionam corretamente | Baixa | Alto | Testar gatilhos em staging; validar com simulação de falhas |
+        | Custo de operação aumenta significativamente | Média | Médio | Estimar custo na Etapa 3; comparar com batch |
+        | Equivalência não é alcançada (streaming ≠ batch) | Média | Alto | Investigar causa raiz; ajustar transformações se necessário |
+
+        ---
+
+        ## Dados faltantes e confirmações necessárias
+
+        ### Dados que faltam:
+
+        1. **Confirmação de SLAs com consumidores:** Sentinel, Cerebro e Pepper confirmaram os SLOs propostos?
+        2. **Capacidade de Sentinel:** Consegue processar dados a cada 30 s sem overhead?
+        3. **Capacidade de Cerebro:** Consegue ingerir dados a cada 30 s sem fragmentação?
+        4. **Capacidade de Pepper:** Query de billing consegue deduplicar corretamente?
+        5. **Custo de streaming:** Qual é o custo estimado de streaming vs batch?
+        6. **Retenção no Relay:** Quantos dias de eventos estão disponíveis para replay?
+        7. **Tamanho de estado por tenant:** Qual é o maior tenant em termos de volume?
+
+        ### Confirmações que derrubariam/validariam escolhas futuras:
+
+        - Se **SLO de 2 min p95 não for alcançável**, aumentar para 5 min ou 10 min.
+        - Se **consumidores não conseguem lidar com duplicatas**, usar exactly-once em vez de at-least-once.
+        - Se **custo de streaming > 2× custo de batch**, reconsiderar viabilidade econômica.
+        - Se **retenção no Relay < 24h**, implementar buffer local para replay.
+        - Se **tamanho de estado por tenant > 10 GB**, usar state store distribuído.
+
+        ---
+
+        ## Suposições marcadas
+
+        | # | Suposição | Razão | Confirmação necessária |
+        |---|-----------|-------|------------------------|
+        | [SUPOSIÇÃO-1] | SLO de 2 min p95 é alcançável com streaming | Baseado em latência de batch (105 min) | Validar com protótipo (Etapa 3) |
+        | [SUPOSIÇÃO-2] | At-Least-Once com idempotência é suficiente | Padrão em streaming; sem overhead de 2-phase commit | Validar com consumidores |
+        | [SUPOSIÇÃO-3] | Deduplicação no DW é simples (INSERT ... ON CONFLICT) | Padrão em SQL; suportado por Snowflake, BigQuery, Redshift | Confirmar com time de DW |
+        | [SUPOSIÇÃO-4] | Consumidores conseguem lidar com duplicatas | Queries podem usar DISTINCT ou GROUP BY | Testar com dados reais |
+        | [SUPOSIÇÃO-5] | Orçamento de erro é realista (0.1% completude, 0.1% corretude) | Baseado em SLA de 99.9% | Validar com dados históricos |
+        | [SUPOSIÇÃO-6] | Gatilhos de rollback funcionam corretamente | Implementação simples com alertas e confirmação manual | Testar em staging |
+        | [SUPOSIÇÃO-7] | SLAs herdados são confirmados com consumidores | Assumindo comunicação com Sentinel, Cerebro, Pepper | Enviar questionário agora |
+        | [SUPOSIÇÃO-8] | Pepper consegue validar dados antes de faturar | Assumindo query de billing com deduplicação | Testar com dados reais |
+
+        ---
+
+        ## Próximos passos (Etapa 3)
+
+        Após conclusão desta etapa, os SLOs e critérios de equivalência alimentarão:
+
+        - **Etapa 3:** Arquitetura de streaming (Kafka Streams, Flink, Spark Structured Streaming).
+        - **Etapa 4:** Prototipagem de um bloco de 30 s com validação de SLOs.
+        - **Etapa 5:** Validação de equivalência (batch vs streaming).
+        - **Etapa 6–10:** Migração gradual com canary, validação de consumidores, rollback.

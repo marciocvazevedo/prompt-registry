@@ -1,0 +1,2986 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 40000
+      stream: true
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://../rubric/judge-forge-streaming.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a etapa de modelo de escrita no data warehouse da cadeia Least-to-Most de migração do Forge (batch -> event-driven)
+        conforme a rubrica C1-C4, o gabarito e a regra de decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      SISTEMA: Forge
+      FONTE_EVENTOS: Relay
+      DW: data warehouse do Forge
+      CONSUMIDORES: Sentinel (tabelas agregadas), Cerebro (índice de eventos transformados), relatórios de billing da Pepper (execução de madrugada)
+      JANELA_ATUAL: 60 min
+      DURACAO_JOB: ~40 min
+      N_ETAPAS: 14
+      ENGINE: Spark
+      PARTICIONAMENTO: por hora
+      LATENCIA_ALVO: 2 min (p95, do evento no Relay até consultável no DW)
+      TAMANHO_MICRO_LOTE: 30 s
+      AMBIENTE: staging → produção
+      JANELA_DUAL_RUN: 14 dias
+      FATIA_CUTOVER: por tenant, começando pelos 5 menores
+      TOLERANCIA_DIVERGENCIA: 0,1% das linhas por hora
+      FORMATO_SAIDA: Markdown com passos numerados
+      etapa_numero: 5
+      etapa_nome: Modelo de escrita no data warehouse
+      INSUMO_ETAPA_4: |
+        # Etapa 4 de 10: Redesenho das 14 Transformações — Procedimento Técnico
+
+        **Depende de:** Etapas 2 e 3.
+
+        ---
+
+        ## 0. Pré-requisitos
+
+        - [ ] Acesso de leitura ao código-fonte do Forge batch (`forge/jobs/batch_transform.py` ou equivalente)
+        - [ ] Documentação das 14 etapas de transformação Spark (nomes, lógica, dependências)
+        - [ ] Acesso ao repositório de configuração do Forge (`forge/config/`)
+        - [ ] Resultado da Etapa 2 disponível: SLOs (latência p95 = 120 s, completude ≥ 99.9%), semântica ALO, critérios de equivalência
+        - [ ] Resultado da Etapa 3 disponível: contrato de consumo do Relay (tópico, partições, paralelismo, watermark)
+        - [ ] Acesso ao DW para inspecionar schema das tabelas de saída (14 tabelas ou agregações)
+        - [ ] Acesso a logs de execução do batch (últimos 30 dias) para validar padrões de transformação
+        - [ ] Ferramentas: editor de código, SQL client, `spark-submit`, `git`, planilha colaborativa
+        - [ ] Permissão para criar branches de desenvolvimento e PRs no repositório
+        - [ ] Acesso a cluster Spark em staging para testes de transformação
+        - [ ] Acesso a dados históricos do Relay (últimos 7 dias) para teste com dados reais
+        - [ ] Contato técnico confirmado em Sentinel, Cerebro, Pepper para validar saída de transformações
+
+        ---
+
+        ## 1. Mapeie e classifique as 14 etapas de transformação
+
+        **Ação:** Extraia código do batch, documente cada etapa e classifique por tipo.
+
+        **Onde:** Arquivo `forge/docs/transformation-stages.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ### 1.1 Extrair código do batch
+
+        ```bash
+        # Localizar arquivo de transformação batch
+        find forge -name "*batch*transform*" -o -name "*ingest*" | grep -E "\.(py|scala|sql)$"
+        # Exemplo de saída esperada:
+        # forge/jobs/batch_transform.py
+        # forge/jobs/batch_ingest.py
+
+        # Inspecionar arquivo
+        cat forge/jobs/batch_transform.py | head -200
+        # Esperado: código Spark com 14 etapas encadeadas
+        ```
+
+        **Documentação:**
+
+        Crie arquivo `forge/docs/transformation-stages.md`:
+
+        ```markdown
+        # Mapeamento das 14 Etapas de Transformação — Forge Batch → Streaming
+
+        ## Resumo
+        O Forge batch executa 14 etapas de transformação em sequência, totalizando ~40 min.
+        Cada etapa é um job Spark que lê de uma tabela, transforma e escreve em outra.
+
+        ## Etapas Mapeadas
+
+        ### Etapa 1: Ingestão e Parsing
+        **Tipo:** Sem estado (stateless)
+        **Entrada:** Tópico Relay `forge-events-raw`
+        **Saída:** Tabela `forge_events_parsed`
+        **Lógica:**
+        - Desserializar JSON/Avro
+        - Validar schema
+        - Adicionar timestamp de ingestão
+        - Filtrar eventos inválidos
+
+        **Código (batch):**
+        \`\`\`python
+        df_raw = spark.read.parquet("/data/relay/events")
+        df_parsed = df_raw.select(
+            col("event_id"),
+            col("tenant_id"),
+            col("timestamp"),
+            col("service_id"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags"),
+            current_timestamp().alias("ingestion_time")
+        ).filter(col("event_id").isNotNull())
+        df_parsed.write.mode("overwrite").parquet("/data/forge/parsed")
+        \`\`\`
+
+        **Classificação:** ✅ Sem estado → Adequado para streaming
+
+        ---
+
+        ### Etapa 2: Enriquecimento com Metadados de Tenant
+        **Tipo:** Enriquecimento por lookup (stateful)
+        **Entrada:** Tabela `forge_events_parsed`
+        **Saída:** Tabela `forge_events_enriched`
+        **Lógica:**
+        - Fazer join com tabela de metadados de tenant (ex: `tenant_metadata`)
+        - Adicionar campos: `tenant_name`, `tenant_tier`, `region`
+        - Filtrar tenants inativos
+
+        **Código (batch):**
+        \`\`\`python
+        df_parsed = spark.read.parquet("/data/forge/parsed")
+        df_tenant_meta = spark.read.parquet("/data/tenant_metadata")  # Snapshot diário
+        df_enriched = df_parsed.join(
+            df_tenant_meta,
+            on="tenant_id",
+            how="left"
+        ).select(
+            col("event_id"),
+            col("tenant_id"),
+            col("tenant_name"),
+            col("tenant_tier"),
+            col("region"),
+            col("timestamp"),
+            col("service_id"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags")
+        ).filter(col("tenant_name").isNotNull())
+        df_enriched.write.mode("overwrite").parquet("/data/forge/enriched")
+        \`\`\`
+
+        **Classificação:** ⚠️ Enriquecimento por lookup → Requer estado (cache de metadados)
+
+        ---
+
+        ### Etapa 3: Normalização de Métrica
+        **Tipo:** Sem estado (stateless)
+        **Entrada:** Tabela `forge_events_enriched`
+        **Saída:** Tabela `forge_events_normalized`
+        **Lógica:**
+        - Normalizar nome de métrica (ex: `http.requests` → `http_requests`)
+        - Converter unidades (ex: ms → s)
+        - Aplicar regras de transformação por tenant
+
+        **Código (batch):**
+        \`\`\`python
+        df_enriched = spark.read.parquet("/data/forge/enriched")
+        df_normalized = df_enriched.withColumn(
+            "metric_name_normalized",
+            regexp_replace(col("metric_name"), r"[.-]", "_")
+        ).withColumn(
+            "metric_value_normalized",
+            when(col("metric_name").contains("latency"), col("metric_value") / 1000)
+            .otherwise(col("metric_value"))
+        )
+        df_normalized.write.mode("overwrite").parquet("/data/forge/normalized")
+        \`\`\`
+
+        **Classificação:** ✅ Sem estado → Adequado para streaming
+
+        ---
+
+        ### Etapa 4: Agregação por Serviço (Janela de 1 Hora)
+        **Tipo:** Agregação por janela (stateful)
+        **Entrada:** Tabela `forge_events_normalized`
+        **Saída:** Tabela `forge_events_by_service`
+        **Lógica:**
+        - Agrupar por `tenant_id`, `service_id`, `hour`
+        - Calcular: `SUM(metric_value)`, `COUNT(*)`, `AVG(metric_value)`, `STDDEV(metric_value)`
+        - Particionar por hora
+
+        **Código (batch):**
+        \`\`\`python
+        df_normalized = spark.read.parquet("/data/forge/normalized")
+        df_by_service = df_normalized.groupBy(
+            date_trunc("hour", col("timestamp")).alias("hour"),
+            col("tenant_id"),
+            col("service_id")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value"),
+            stddev("metric_value").alias("stddev_value")
+        )
+        df_by_service.write.mode("overwrite").partitionBy("hour").parquet("/data/forge/by_service")
+        \`\`\`
+
+        **Classificação:** ✅ Agregação por janela → Adequado para streaming (com watermark)
+
+        ---
+
+        ### Etapa 5: Agregação Global (Janela de 1 Hora)
+        **Tipo:** Agregação por janela (stateful)
+        **Entrada:** Tabela `forge_events_normalized`
+        **Saída:** Tabela `forge_events_aggregated`
+        **Lógica:**
+        - Agrupar por `tenant_id`, `hour`
+        - Calcular: `SUM(metric_value)`, `COUNT(*)`, `AVG(metric_value)`
+        - Particionar por hora
+
+        **Código (batch):**
+        \`\`\`python
+        df_normalized = spark.read.parquet("/data/forge/normalized")
+        df_aggregated = df_normalized.groupBy(
+            date_trunc("hour", col("timestamp")).alias("hour"),
+            col("tenant_id")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value")
+        )
+        df_aggregated.write.mode("overwrite").partitionBy("hour").parquet("/data/forge/aggregated")
+        \`\`\`
+
+        **Classificação:** ✅ Agregação por janela → Adequado para streaming (com watermark)
+
+        ---
+
+        ### Etapa 6: Cálculo de Taxa de Erro
+        **Tipo:** Sem estado (stateless) + Enriquecimento por lookup
+        **Entrada:** Tabela `forge_events_by_service`
+        **Saída:** Tabela `forge_error_rates`
+        **Lógica:**
+        - Filtrar eventos com `metric_name` = "error"
+        - Calcular taxa de erro: `error_count / total_count`
+        - Fazer join com SLA de tenant para comparar
+
+        **Código (batch):**
+        \`\`\`python
+        df_by_service = spark.read.parquet("/data/forge/by_service")
+        df_sla = spark.read.parquet("/data/sla_config")  # Snapshot diário
+        df_error_rates = df_by_service.filter(
+            col("metric_name") == "error"
+        ).join(
+            df_sla,
+            on=["tenant_id", "service_id"],
+            how="left"
+        ).withColumn(
+            "error_rate",
+            col("total_value") / col("event_count")
+        ).withColumn(
+            "sla_breached",
+            col("error_rate") > col("sla_threshold")
+        )
+        df_error_rates.write.mode("overwrite").parquet("/data/forge/error_rates")
+        \`\`\`
+
+        **Classificação:** ⚠️ Enriquecimento por lookup → Requer estado (cache de SLA)
+
+        ---
+
+        ### Etapa 7: Detecção de Anomalia
+        **Tipo:** Agregação por janela + Enriquecimento por lookup (stateful)
+        **Entrada:** Tabela `forge_events_aggregated`
+        **Saída:** Tabela `forge_anomalies`
+        **Lógica:**
+        - Calcular média e desvio padrão de `metric_value` para cada tenant (últimas 24h)
+        - Detectar valores > 3σ como anomalia
+        - Fazer join com histórico de anomalias para evitar duplicatas
+
+        **Código (batch):**
+        \`\`\`python
+        df_aggregated = spark.read.parquet("/data/forge/aggregated")
+        df_history = spark.read.parquet("/data/forge/anomalies")  # Últimas 24h
+        df_stats = df_aggregated.groupBy("tenant_id").agg(
+            avg("total_value").alias("mean_value"),
+            stddev("total_value").alias("stddev_value")
+        )
+        df_anomalies = df_aggregated.join(
+            df_stats,
+            on="tenant_id"
+        ).withColumn(
+            "z_score",
+            (col("total_value") - col("mean_value")) / col("stddev_value")
+        ).filter(
+            abs(col("z_score")) > 3
+        ).join(
+            df_history,
+            on=["tenant_id", "hour"],
+            how="left_anti"  # Evitar duplicatas
+        )
+        df_anomalies.write.mode("overwrite").parquet("/data/forge/anomalies")
+        \`\`\`
+
+        **Classificação:** ⚠️ Agregação + Lookup → Requer estado (histórico de anomalias)
+
+        ---
+
+        ### Etapa 8: Cálculo de SLA Violations
+        **Tipo:** Agregação por janela + Enriquecimento por lookup (stateful)
+        **Entrada:** Tabela `forge_error_rates`
+        **Saída:** Tabela `forge_sla_violations`
+        **Lógica:**
+        - Comparar `error_rate` com `sla_threshold` (de Etapa 6)
+        - Registrar violações de SLA
+        - Fazer join com histórico para evitar duplicatas
+
+        **Código (batch):**
+        \`\`\`python
+        df_error_rates = spark.read.parquet("/data/forge/error_rates")
+        df_violations_history = spark.read.parquet("/data/forge/sla_violations")  # Últimas 24h
+        df_violations = df_error_rates.filter(
+            col("sla_breached") == True
+        ).join(
+            df_violations_history,
+            on=["tenant_id", "service_id", "hour"],
+            how="left_anti"  # Evitar duplicatas
+        ).select(
+            col("hour"),
+            col("tenant_id"),
+            col("service_id"),
+            col("error_rate"),
+            col("sla_threshold"),
+            lit(True).alias("sla_breached")
+        )
+        df_violations.write.mode("overwrite").parquet("/data/forge/sla_violations")
+        \`\`\`
+
+        **Classificação:** ⚠️ Agregação + Lookup → Requer estado (histórico de violações)
+
+        ---
+
+        ### Etapa 9: Enriquecimento com Contexto de Deployment
+        **Tipo:** Enriquecimento por lookup (stateful)
+        **Entrada:** Tabela `forge_events_enriched`
+        **Saída:** Tabela `forge_events_with_deployment`
+        **Lógica:**
+        - Fazer join com tabela de deployment (ex: `deployment_info`)
+        - Adicionar campos: `version`, `region`, `environment`
+        - Filtrar eventos de deployments inativos
+
+        **Código (batch):**
+        \`\`\`python
+        df_enriched = spark.read.parquet("/data/forge/enriched")
+        df_deployment = spark.read.parquet("/data/deployment_info")  # Snapshot diário
+        df_with_deployment = df_enriched.join(
+            df_deployment,
+            on=["tenant_id", "service_id"],
+            how="left"
+        ).select(
+            col("event_id"),
+            col("tenant_id"),
+            col("service_id"),
+            col("version"),
+            col("region"),
+            col("environment"),
+            col("timestamp"),
+            col("metric_name"),
+            col("metric_value")
+        )
+        df_with_deployment.write.mode("overwrite").parquet("/data/forge/with_deployment")
+        \`\`\`
+
+        **Classificação:** ⚠️ Enriquecimento por lookup → Requer estado (cache de deployment)
+
+        ---
+
+        ### Etapa 10: Agregação por Versão
+        **Tipo:** Agregação por janela (stateful)
+        **Entrada:** Tabela `forge_events_with_deployment`
+        **Saída:** Tabela `forge_events_by_version`
+        **Lógica:**
+        - Agrupar por `tenant_id`, `service_id`, `version`, `hour`
+        - Calcular: `SUM(metric_value)`, `COUNT(*)`, `AVG(metric_value)`
+        - Particionar por hora
+
+        **Código (batch):**
+        \`\`\`python
+        df_with_deployment = spark.read.parquet("/data/forge/with_deployment")
+        df_by_version = df_with_deployment.groupBy(
+            date_trunc("hour", col("timestamp")).alias("hour"),
+            col("tenant_id"),
+            col("service_id"),
+            col("version")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value")
+        )
+        df_by_version.write.mode("overwrite").partitionBy("hour").parquet("/data/forge/by_version")
+        \`\`\`
+
+        **Classificação:** ✅ Agregação por janela → Adequado para streaming (com watermark)
+
+        ---
+
+        ### Etapa 11: Cálculo de Percentis
+        **Tipo:** Agregação por janela (stateful)
+        **Entrada:** Tabela `forge_events_aggregated`
+        **Saída:** Tabela `forge_percentiles`
+        **Lógica:**
+        - Calcular percentis (p50, p95, p99) de `metric_value` por tenant/hora
+        - Usar aproximação (ex: `percentile_approx`)
+
+        **Código (batch):**
+        \`\`\`python
+        df_aggregated = spark.read.parquet("/data/forge/aggregated")
+        df_percentiles = df_aggregated.groupBy(
+            date_trunc("hour", col("timestamp")).alias("hour"),
+            col("tenant_id")
+        ).agg(
+            percentile_approx("metric_value", 0.5).alias("p50"),
+            percentile_approx("metric_value", 0.95).alias("p95"),
+            percentile_approx("metric_value", 0.99).alias("p99")
+        )
+        df_percentiles.write.mode("overwrite").partitionBy("hour").parquet("/data/forge/percentiles")
+        \`\`\`
+
+        **Classificação:** ✅ Agregação por janela → Adequado para streaming (com watermark)
+
+        ---
+
+        ### Etapa 12: Detecção de Mudança de Comportamento
+        **Tipo:** Agregação por janela + Enriquecimento por lookup (stateful)
+        **Entrada:** Tabela `forge_events_aggregated`
+        **Saída:** Tabela `forge_behavior_changes`
+        **Lógica:**
+        - Comparar `metric_value` atual com média histórica (últimas 7 dias)
+        - Detectar mudanças > 50% como "behavior change"
+        - Fazer join com histórico para evitar duplicatas
+
+        **Código (batch):**
+        \`\`\`python
+        df_aggregated = spark.read.parquet("/data/forge/aggregated")
+        df_history_7d = spark.read.parquet("/data/forge/aggregated_history_7d")  # Últimas 7 dias
+        df_baseline = df_history_7d.groupBy("tenant_id").agg(
+            avg("total_value").alias("baseline_value")
+        )
+        df_changes = df_aggregated.join(
+            df_baseline,
+            on="tenant_id"
+        ).withColumn(
+            "change_pct",
+            abs(col("total_value") - col("baseline_value")) / col("baseline_value") * 100
+        ).filter(
+            col("change_pct") > 50
+        )
+        df_changes.write.mode("overwrite").parquet("/data/forge/behavior_changes")
+        \`\`\`
+
+        **Classificação:** ⚠️ Agregação + Lookup → Requer estado (histórico de 7 dias)
+
+        ---
+
+        ### Etapa 13: Agregação para Billing
+        **Tipo:** Agregação por janela (stateful)
+        **Entrada:** Tabela `forge_events_normalized`
+        **Saída:** Tabela `forge_billing_events`
+        **Lógica:**
+        - Agrupar por `tenant_id`, `day`
+        - Calcular: `SUM(event_count)` (para billing por evento)
+        - Particionar por dia
+        - Deduplicar por `event_id` (para evitar overcharging)
+
+        **Código (batch):**
+        \`\`\`python
+        df_normalized = spark.read.parquet("/data/forge/normalized")
+        df_billing = df_normalized.groupBy(
+            date_trunc("day", col("timestamp")).alias("day"),
+            col("tenant_id")
+        ).agg(
+            count(distinct("event_id")).alias("unique_event_count"),
+            count("*").alias("total_event_count")
+        )
+        df_billing.write.mode("overwrite").partitionBy("day").parquet("/data/forge/billing_events")
+        \`\`\`
+
+        **Classificação:** ✅ Agregação por janela → Adequado para streaming (com watermark)
+
+        ---
+
+        ### Etapa 14: Exportação para Cerebro (Índice de Logs)
+        **Tipo:** Sem estado (stateless)
+        **Entrada:** Tabela `forge_events_enriched`
+        **Saída:** Tópico Kafka `forge-events-indexed` (ou índice Elasticsearch)
+        **Lógica:**
+        - Selecionar campos relevantes para busca
+        - Serializar para JSON
+        - Enviar para Cerebro (Kafka ou Elasticsearch)
+
+        **Código (batch):**
+        \`\`\`python
+        df_enriched = spark.read.parquet("/data/forge/enriched")
+        df_for_cerebro = df_enriched.select(
+            col("event_id"),
+            col("tenant_id"),
+            col("service_id"),
+            col("timestamp"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags"),
+            to_json(struct("*")).alias("json_payload")
+        )
+        df_for_cerebro.write.format("kafka") \
+            .option("kafka.bootstrap.servers", "<relay-broker>") \
+            .option("topic", "forge-events-indexed") \
+            .mode("append") \
+            .save()
+        \`\`\`
+
+        **Classificação:** ✅ Sem estado → Adequado para streaming
+
+        ---
+
+        ## Resumo de Classificação
+
+        | Etapa | Nome | Tipo | Streaming? | Justificativa |
+        |-------|------|------|-----------|---------------|
+        | 1 | Parsing | Sem estado | ✅ Sim | Sem dependência de estado |
+        | 2 | Enriquecimento Tenant | Lookup | ⚠️ Condicional | Requer cache de metadados (atualizar 1× por dia) |
+        | 3 | Normalização | Sem estado | ✅ Sim | Sem dependência de estado |
+        | 4 | Agregação por Serviço | Janela | ✅ Sim | Janela de 30 s em vez de 1h |
+        | 5 | Agregação Global | Janela | ✅ Sim | Janela de 30 s em vez de 1h |
+        | 6 | Taxa de Erro | Lookup | ⚠️ Condicional | Requer cache de SLA (atualizar 1× por dia) |
+        | 7 | Detecção de Anomalia | Lookup | ⚠️ Condicional | Requer histórico de 24h (estado grande) |
+        | 8 | SLA Violations | Lookup | ⚠️ Condicional | Requer histórico de 24h (estado grande) |
+        | 9 | Enriquecimento Deployment | Lookup | ⚠️ Condicional | Requer cache de deployment (atualizar 1× por dia) |
+        | 10 | Agregação por Versão | Janela | ✅ Sim | Janela de 30 s em vez de 1h |
+        | 11 | Cálculo de Percentis | Janela | ✅ Sim | Janela de 30 s em vez de 1h |
+        | 12 | Detecção de Mudança | Lookup | ❌ Não | Requer histórico de 7 dias (estado muito grande) |
+        | 13 | Agregação para Billing | Janela | ✅ Sim | Janela de 1 dia em vez de 1 dia (sem mudança) |
+        | 14 | Exportação Cerebro | Sem estado | ✅ Sim | Sem dependência de estado |
+
+        ---
+
+        ## Decisões de Implementação
+
+        ### Etapas que permanecem em streaming (9 etapas):
+        1, 3, 4, 5, 10, 11, 13, 14 + Etapa 2, 6, 9 com cache atualizado 1× por dia
+
+        ### Etapas que permanecem em batch (2 etapas):
+        7 (Detecção de Anomalia), 8 (SLA Violations), 12 (Detecção de Mudança)
+
+        **Justificativa:** Etapas 7, 8, 12 requerem estado histórico grande (24h–7 dias) que não é viável em streaming com latência de 30 s. Essas etapas serão executadas em batch 1× por hora (ou 1× por dia) e seus resultados serão consumidos por Sentinel/Cerebro.
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que documentação está completa
+        grep -c "Etapa [0-9]" forge/docs/transformation-stages.md
+        # Esperado: 14 etapas documentadas
+        ```
+
+        ---
+
+        ## 2. Defina janelas, watermarks e política de eventos atrasados por etapa
+
+        **Ação:** Para cada etapa de agregação, defina tamanho de janela, watermark e política de late events.
+
+        **Onde:** Arquivo `forge/config/windowing-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Janelas, Watermarks e Eventos Atrasados
+
+        ## Definições Gerais
+        - **Janela:** Período de tempo em que eventos são agrupados (ex: 30 s, 1 min, 1 hora)
+        - **Watermark:** Timestamp máximo processado - margem de atraso (ex: 45 s)
+        - **Allowed lateness:** Tempo máximo que um evento pode chegar atrasado e ainda ser processado
+        - **Late drop:** Eventos que chegam após allowed lateness são descartados
+
+        ## Estratégia por Etapa
+
+        ### Etapa 4: Agregação por Serviço
+        **Janela:** 30 segundos (em vez de 1 hora no batch)
+        **Watermark:** 45 segundos (de Etapa 3)
+        **Allowed lateness:** 60 segundos
+        **Late drop:** > 105 segundos
+        **Modo de saída:** `update` (permite atualização retroativa)
+
+        **Justificativa:**
+        - Janela de 30 s alinha com intervalo de processamento do Forge
+        - Watermark de 45 s permite que 99% dos eventos sejam processados no tempo
+        - Allowed lateness de 60 s permite atualização de agregações já escritas
+        - Modo `update` permite que eventos atrasados atualizem linhas já no DW
+
+        **Implementação (Spark Structured Streaming):**
+        ```python
+        df_normalized = spark.readStream.format("kafka")...
+        df_watermarked = df_normalized.withWatermark("timestamp", "45 seconds")
+        df_by_service = df_watermarked.groupBy(
+            window(col("timestamp"), "30 seconds"),
+            col("tenant_id"),
+            col("service_id")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value"),
+            stddev("metric_value").alias("stddev_value")
+        )
+        query = df_by_service.writeStream \
+            .format("parquet") \
+            .option("path", "/data/forge/by_service") \
+            .option("checkpointLocation", "/data/forge/checkpoint/by_service") \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        **Validação:**
+        - [ ] Testar com eventos injetados com atraso de 50 s (deve ser processado)
+        - [ ] Testar com eventos injetados com atraso de 120 s (deve ser descartado)
+        - [ ] Validar que completude ≥ 99.9%
+
+        ---
+
+        ### Etapa 5: Agregação Global
+        **Janela:** 30 segundos (em vez de 1 hora no batch)
+        **Watermark:** 45 segundos (de Etapa 3)
+        **Allowed lateness:** 60 segundos
+        **Late drop:** > 105 segundos
+        **Modo de saída:** `update`
+
+        **Justificativa:** Idêntica à Etapa 4
+
+        **Implementação:**
+        ```python
+        df_watermarked = df_normalized.withWatermark("timestamp", "45 seconds")
+        df_aggregated = df_watermarked.groupBy(
+            window(col("timestamp"), "30 seconds"),
+            col("tenant_id")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value")
+        )
+        query = df_aggregated.writeStream \
+            .format("parquet") \
+            .option("path", "/data/forge/aggregated") \
+            .option("checkpointLocation", "/data/forge/checkpoint/aggregated") \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .start()
+        ```
+
+        ---
+
+        ### Etapa 10: Agregação por Versão
+        **Janela:** 30 segundos (em vez de 1 hora no batch)
+        **Watermark:** 45 segundos (de Etapa 3)
+        **Allowed lateness:** 60 segundos
+        **Late drop:** > 105 segundos
+        **Modo de saída:** `update`
+
+        **Justificativa:** Idêntica à Etapa 4
+
+        ---
+
+        ### Etapa 11: Cálculo de Percentis
+        **Janela:** 30 segundos (em vez de 1 hora no batch)
+        **Watermark:** 45 segundos (de Etapa 3)
+        **Allowed lateness:** 60 segundos
+        **Late drop:** > 105 segundos
+        **Modo de saída:** `update`
+
+        **Justificativa:** Idêntica à Etapa 4
+
+        **Nota:** Percentis são aproximados usando `percentile_approx()` (não exatos)
+
+        ---
+
+        ### Etapa 13: Agregação para Billing
+        **Janela:** 1 dia (sem mudança em relação ao batch)
+        **Watermark:** 24 horas (permitir eventos do dia anterior)
+        **Allowed lateness:** 48 horas (permitir eventos de 2 dias atrás)
+        **Late drop:** > 72 horas
+        **Modo de saída:** `update`
+
+        **Justificativa:**
+        - Billing é crítico; não pode perder eventos
+        - Janela de 1 dia alinha com ciclo de faturamento
+        - Allowed lateness de 48 h permite que eventos atrasados sejam incluídos antes do relatório (02:00 UTC)
+
+        **Implementação:**
+        ```python
+        df_watermarked = df_normalized.withWatermark("timestamp", "24 hours")
+        df_billing = df_watermarked.groupBy(
+            window(col("timestamp"), "1 day"),
+            col("tenant_id")
+        ).agg(
+            count(distinct("event_id")).alias("unique_event_count"),
+            count("*").alias("total_event_count")
+        )
+        query = df_billing.writeStream \
+            .format("parquet") \
+            .option("path", "/data/forge/billing_events") \
+            .option("checkpointLocation", "/data/forge/checkpoint/billing") \
+            .outputMode("update") \
+            .trigger(processingTime="1 hour") \
+            .start()
+        ```
+
+        ---
+
+        ## Resumo de Estratégia de Janelas
+
+        | Etapa | Janela | Watermark | Allowed Lateness | Late Drop | Modo |
+        |-------|--------|-----------|------------------|-----------|------|
+        | 4 | 30 s | 45 s | 60 s | > 105 s | update |
+        | 5 | 30 s | 45 s | 60 s | > 105 s | update |
+        | 10 | 30 s | 45 s | 60 s | > 105 s | update |
+        | 11 | 30 s | 45 s | 60 s | > 105 s | update |
+        | 13 | 1 dia | 24 h | 48 h | > 72 h | update |
+
+        ---
+
+        ## Implicações para Consumidores
+
+        ### Sentinel (Dashboards)
+        - Dados chegam a cada 30 s (em vez de 60 min)
+        - Agregações podem ser atualizadas retroativamente (modo `update`)
+        - Queries devem usar `DISTINCT` ou `GROUP BY` para deduplicação
+
+        ### Cerebro (Indexação)
+        - Eventos chegam a cada 30 s (em vez de 60 min)
+        - Índice pode ter duplicatas em reprocessamento
+        - Indexador deve deduplicar por `event_id`
+
+        ### Pepper (Billing)
+        - Relatório roda 1× por dia (02:00 UTC)
+        - Allowed lateness de 48 h garante que eventos atrasados sejam incluídos
+        - Query de billing deve deduplicar por `event_id`
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que estratégia de janelas está documentada
+        grep -E "Janela:|Watermark:|Allowed lateness:" forge/config/windowing-strategy.md | wc -l
+        # Esperado: > 15 linhas (3 por etapa × 5 etapas)
+        ```
+
+        ---
+
+        ## 3. Defina estado, tamanho estimado e política de expiração
+
+        **Ação:** Para cada etapa com lookup ou histórico, defina onde fica o estado, tamanho e expiração.
+
+        **Onde:** Arquivo `forge/config/state-management.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Gerenciamento de Estado — Forge Streaming
+
+        ## Definições
+        - **Estado:** Dados mantidos em memória ou disco para suportar operações stateful (lookup, histórico)
+        - **Tamanho:** Quantidade de dados em estado (bytes, GB)
+        - **TTL (Time To Live):** Tempo máximo que um estado é mantido antes de expiração
+        - **Expiração:** Política de limpeza de estado expirado
+
+        ## Estado por Etapa
+
+        ### Etapa 2: Enriquecimento com Metadados de Tenant
+        **Tipo de estado:** Cache de lookup (broadcast)
+        **Dados:** Tabela `tenant_metadata` (tenant_id → tenant_name, tenant_tier, region)
+        **Tamanho estimado:** [SUPOSIÇÃO] 10 MB (1000 tenants × 10 KB por tenant)
+        **Fonte:** Snapshot diário de `tenant_metadata` (atualizar 1× por dia)
+        **TTL:** 24 horas
+        **Política de expiração:** Recarregar snapshot a cada 24 horas
+
+        **Implementação:**
+        ```python
+        # Carregar snapshot de tenant_metadata
+        df_tenant_meta = spark.read.parquet("/data/tenant_metadata")
+        broadcast_tenant_meta = broadcast(df_tenant_meta)
+
+        # Usar em join
+        df_enriched = df_parsed.join(
+            broadcast_tenant_meta,
+            on="tenant_id",
+            how="left"
+        )
+        ```
+
+        **Validação:**
+        - [ ] Snapshot é carregado corretamente
+        - [ ] Tamanho do broadcast é < 100 MB (limite típico)
+        - [ ] Recarregamento a cada 24 h funciona sem interrupção
+
+        ---
+
+        ### Etapa 6: Cálculo de Taxa de Erro (Lookup de SLA)
+        **Tipo de estado:** Cache de lookup (broadcast)
+        **Dados:** Tabela `sla_config` (tenant_id, service_id → sla_threshold)
+        **Tamanho estimado:** [SUPOSIÇÃO] 50 MB (1000 tenants × 100 serviços × 50 bytes)
+        **Fonte:** Snapshot diário de `sla_config` (atualizar 1× por dia)
+        **TTL:** 24 horas
+        **Política de expiração:** Recarregar snapshot a cada 24 horas
+
+        **Implementação:**
+        ```python
+        df_sla = spark.read.parquet("/data/sla_config")
+        broadcast_sla = broadcast(df_sla)
+
+        df_error_rates = df_by_service.join(
+            broadcast_sla,
+            on=["tenant_id", "service_id"],
+            how="left"
+        ).withColumn(
+            "sla_breached",
+            col("error_rate") > col("sla_threshold")
+        )
+        ```
+
+        ---
+
+        ### Etapa 7: Detecção de Anomalia (Histórico de 24h)
+        **Tipo de estado:** Histórico em estado (RocksDB ou equivalente)
+        **Dados:** Agregações dos últimos 24 horas (tenant_id, hour → mean, stddev)
+        **Tamanho estimado:** [SUPOSIÇÃO] 1 GB (1000 tenants × 24 horas × 50 KB por hora)
+        **Fonte:** Leitura contínua de `forge_events_aggregated` (últimas 24h)
+        **TTL:** 24 horas
+        **Política de expiração:** Remover dados > 24 horas automaticamente
+
+        **Implementação (Spark Structured Streaming com state store):**
+        ```python
+        def detect_anomalies(df):
+            # Usar mapGroupsWithState para manter histórico de 24h
+            def state_func(key, values, state):
+                tenant_id = key
+                current_values = list(values)
+                
+                # Recuperar estado anterior
+                if state.exists:
+                    historical_data = state.get
+                else:
+                    historical_data = []
+                
+                # Adicionar valores atuais
+                historical_data.extend(current_values)
+                
+                # Remover dados > 24h
+                cutoff_time = current_time - timedelta(hours=24)
+                historical_data = [v for v in historical_data if v['timestamp'] > cutoff_time]
+                
+                # Calcular média e desvio padrão
+                mean = np.mean([v['metric_value'] for v in historical_data])
+                stddev = np.std([v['metric_value'] for v in historical_data])
+                
+                # Detectar anomalias
+                anomalies = [v for v in current_values if abs((v['metric_value'] - mean) / stddev) > 3]
+                
+                # Atualizar estado
+                state.update(historical_data)
+                
+                return anomalies
+            
+            df_anomalies = df.groupByKey("tenant_id").mapGroupsWithState(
+                outputMode="update",
+                timeoutConf="event time",
+                func=state_func
+            )
+            return df_anomalies
+        ```
+
+        **Validação:**
+        - [ ] Estado é mantido em RocksDB (ou equivalente)
+        - [ ] Tamanho do estado não excede 10 GB (limite típico)
+        - [ ] Dados > 24h são removidos automaticamente
+        - [ ] Detecção de anomalia funciona corretamente
+
+        ---
+
+        ### Etapa 8: SLA Violations (Histórico de 24h)
+        **Tipo de estado:** Histórico em estado (RocksDB ou equivalente)
+        **Dados:** Violações dos últimos 24 horas (tenant_id, service_id, hour → sla_breached)
+        **Tamanho estimado:** [SUPOSIÇÃO] 500 MB (1000 tenants × 100 serviços × 24 horas × 20 bytes)
+        **Fonte:** Leitura contínua de `forge_error_rates` (últimas 24h)
+        **TTL:** 24 horas
+        **Política de expiração:** Remover dados > 24 horas automaticamente
+
+        **Implementação:** Idêntica à Etapa 7
+
+        ---
+
+        ### Etapa 9: Enriquecimento com Deployment
+        **Tipo de estado:** Cache de lookup (broadcast)
+        **Dados:** Tabela `deployment_info` (tenant_id, service_id → version, region, environment)
+        **Tamanho estimado:** [SUPOSIÇÃO] 100 MB (1000 tenants × 100 serviços × 1 KB por deployment)
+        **Fonte:** Snapshot diário de `deployment_info` (atualizar 1× por dia)
+        **TTL:** 24 horas
+        **Política de expiração:** Recarregar snapshot a cada 24 horas
+
+        **Implementação:**
+        ```python
+        df_deployment = spark.read.parquet("/data/deployment_info")
+        broadcast_deployment = broadcast(df_deployment)
+
+        df_with_deployment = df_enriched.join(
+            broadcast_deployment,
+            on=["tenant_id", "service_id"],
+            how="left"
+        )
+        ```
+
+        ---
+
+        ### Etapa 12: Detecção de Mudança de Comportamento (Histórico de 7 dias)
+        **Tipo de estado:** Histórico em estado (RocksDB ou equivalente)
+        **Dados:** Agregações dos últimos 7 dias (tenant_id, day → baseline_value)
+        **Tamanho estimado:** [SUPOSIÇÃO] 7 GB (1000 tenants × 7 dias × 1 MB por dia)
+        **Fonte:** Leitura contínua de `forge_events_aggregated` (últimos 7 dias)
+        **TTL:** 7 dias
+        **Política de expiração:** Remover dados > 7 dias automaticamente
+
+        **Implementação:** Idêntica à Etapa 7, mas com TTL de 7 dias
+
+        **Nota:** Etapa 12 é muito cara em streaming (7 GB de estado). Recomenda-se manter em batch (1× por dia).
+
+        ---
+
+        ## Resumo de Estado
+
+        | Etapa | Tipo | Tamanho | TTL | Fonte | Política |
+        |-------|------|--------|-----|-------|----------|
+        | 2 | Broadcast | 10 MB | 24 h | Snapshot diário | Recarregar 1× por dia |
+        | 6 | Broadcast | 50 MB | 24 h | Snapshot diário | Recarregar 1× por dia |
+        | 7 | RocksDB | 1 GB | 24 h | Leitura contínua | Remover > 24h |
+        | 8 | RocksDB | 500 MB | 24 h | Leitura contínua | Remover > 24h |
+        | 9 | Broadcast | 100 MB | 24 h | Snapshot diário | Recarregar 1× por dia |
+        | 12 | RocksDB | 7 GB | 7 dias | Leitura contínua | Remover > 7 dias (BATCH) |
+
+        ---
+
+        ## Configuração de RocksDB (Spark Structured Streaming)
+
+        ```python
+        # Configurar RocksDB para estado
+        spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+                    "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+        spark.conf.set("spark.sql.streaming.stateStore.rocksdb.blockCacheSize", "1g")
+        spark.conf.set("spark.sql.streaming.stateStore.rocksdb.blockSize", "4096")
+        spark.conf.set("spark.sql.streaming.stateStore.rocksdb.numBackgroundThreads", "4")
+        ```
+
+        ---
+
+        ## Monitoramento de Estado
+
+        ```python
+        # Adicionar métricas de estado
+        df_with_state.writeStream \
+            .format("parquet") \
+            .option("path", "/data/forge/anomalies") \
+            .option("checkpointLocation", "/data/forge/checkpoint/anomalies") \
+            .outputMode("update") \
+            .trigger(processingTime="30 seconds") \
+            .foreachBatch(lambda df, batch_id: log_state_metrics(df, batch_id)) \
+            .start()
+
+        def log_state_metrics(df, batch_id):
+            state_size = df.rdd.map(lambda x: len(str(x))).sum()
+            print(f"Batch {batch_id}: State size = {state_size / 1e9:.2f} GB")
+        ```
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que estado está documentado
+        grep -E "Tamanho estimado:|TTL:|Política de expiração:" forge/config/state-management.md | wc -l
+        # Esperado: > 15 linhas (3 por etapa × 5 etapas com estado)
+        ```
+
+        ---
+
+        ## 4. Torne cada etapa idempotente e reexecutável
+
+        **Ação:** Defina chave de deduplicação e chave natural para cada etapa.
+
+        **Onde:** Arquivo `forge/config/idempotency-strategy.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Idempotência e Reexecutabilidade
+
+        ## Definições
+        - **Idempotência:** Executar uma operação múltiplas vezes produz o mesmo resultado que executar uma vez
+        - **Chave de deduplicação:** Campo único que identifica um evento (ex: `event_id`)
+        - **Chave natural:** Combinação de campos que identifica um resultado (ex: `tenant_id + service_id + hour`)
+        - **Reexecutabilidade:** Capacidade de reexecutar uma etapa sem perder dados ou criar duplicatas
+
+        ## Estratégia por Etapa
+
+        ### Etapa 1: Parsing
+        **Chave de deduplicação:** `event_id`
+        **Chave natural:** `event_id` (cada evento é único)
+        **Implementação:**
+        ```python
+        df_parsed = df_raw.select(
+            col("event_id"),
+            col("tenant_id"),
+            col("timestamp"),
+            col("service_id"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags"),
+            current_timestamp().alias("ingestion_time")
+        ).filter(col("event_id").isNotNull())
+
+        # Deduplicar por event_id (em caso de reprocessamento)
+        df_deduplicated = df_parsed.dropDuplicates(["event_id"])
+        ```
+
+        **Validação:**
+        - [ ] Cada `event_id` aparece no máximo 1× na saída
+        - [ ] Nenhum evento é perdido (completude ≥ 99.9%)
+
+        ---
+
+        ### Etapa 2: Enriquecimento Tenant
+        **Chave de deduplicação:** `event_id`
+        **Chave natural:** `event_id` (cada evento é único)
+        **Implementação:**
+        ```python
+        df_enriched = df_parsed.join(
+            broadcast_tenant_meta,
+            on="tenant_id",
+            how="left"
+        ).select(
+            col("event_id"),
+            col("tenant_id"),
+            col("tenant_name"),
+            col("tenant_tier"),
+            col("region"),
+            col("timestamp"),
+            col("service_id"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags")
+        ).filter(col("tenant_name").isNotNull())
+
+        # Deduplicar por event_id
+        df_deduplicated = df_enriched.dropDuplicates(["event_id"])
+        ```
+
+        ---
+
+        ### Etapa 3: Normalização
+        **Chave de deduplicação:** `event_id`
+        **Chave natural:** `event_id`
+        **Implementação:**
+        ```python
+        df_normalized = df_enriched.withColumn(
+            "metric_name_normalized",
+            regexp_replace(col("metric_name"), r"[.-]", "_")
+        ).withColumn(
+            "metric_value_normalized",
+            when(col("metric_name").contains("latency"), col("metric_value") / 1000)
+            .otherwise(col("metric_value"))
+        )
+
+        # Deduplicar por event_id
+        df_deduplicated = df_normalized.dropDuplicates(["event_id"])
+        ```
+
+        ---
+
+        ### Etapa 4: Agregação por Serviço
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `window_start + window_end + tenant_id + service_id`
+        **Implementação:**
+        ```python
+        # Deduplicar antes de agregação
+        df_deduplicated = df_normalized.dropDuplicates(["event_id"])
+
+        # Agregar
+        df_by_service = df_deduplicated.groupBy(
+            window(col("timestamp"), "30 seconds"),
+            col("tenant_id"),
+            col("service_id")
+        ).agg(
+            sum("metric_value").alias("total_value"),
+            count("*").alias("event_count"),
+            avg("metric_value").alias("avg_value"),
+            stddev("metric_value").alias("stddev_value")
+        ).withColumn(
+            "window_start",
+            col("window.start")
+        ).withColumn(
+            "window_end",
+            col("window.end")
+        ).select(
+            col("window_start"),
+            col("window_end"),
+            col("tenant_id"),
+            col("service_id"),
+            col("total_value"),
+            col("event_count"),
+            col("avg_value"),
+            col("stddev_value")
+        )
+
+        # Escrever com deduplicação no DW
+        df_by_service.write.mode("overwrite") \
+            .option("mergeSchema", "true") \
+            .parquet("/data/forge/by_service")
+        ```
+
+        **Validação:**
+        - [ ] Cada combinação de `(window_start, window_end, tenant_id, service_id)` aparece no máximo 1× na saída
+        - [ ] Agregações são corretas (SUM, COUNT, AVG)
+
+        ---
+
+        ### Etapa 5: Agregação Global
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `window_start + window_end + tenant_id`
+        **Implementação:** Idêntica à Etapa 4
+
+        ---
+
+        ### Etapa 6: Taxa de Erro
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `window_start + window_end + tenant_id + service_id`
+        **Implementação:**
+        ```python
+        # Deduplicar antes de agregação
+        df_deduplicated = df_by_service.dropDuplicates(["event_id"])
+
+        # Calcular taxa de erro
+        df_error_rates = df_deduplicated.filter(
+            col("metric_name") == "error"
+        ).join(
+            broadcast_sla,
+            on=["tenant_id", "service_id"],
+            how="left"
+        ).withColumn(
+            "error_rate",
+            col("total_value") / col("event_count")
+        ).withColumn(
+            "sla_breached",
+            col("error_rate") > col("sla_threshold")
+        )
+
+        # Escrever com deduplicação
+        df_error_rates.write.mode("overwrite") \
+            .parquet("/data/forge/error_rates")
+        ```
+
+        ---
+
+        ### Etapa 7: Detecção de Anomalia
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `tenant_id + hour + anomaly_id` (anomaly_id = hash de (mean, stddev, z_score))
+        **Implementação:**
+        ```python
+        # Deduplicar antes de agregação
+        df_deduplicated = df_aggregated.dropDuplicates(["event_id"])
+
+        # Calcular estatísticas
+        df_stats = df_deduplicated.groupBy("tenant_id").agg(
+            avg("total_value").alias("mean_value"),
+            stddev("total_value").alias("stddev_value")
+        )
+
+        # Detectar anomalias
+        df_anomalies = df_deduplicated.join(
+            df_stats,
+            on="tenant_id"
+        ).withColumn(
+            "z_score",
+            (col("total_value") - col("mean_value")) / col("stddev_value")
+        ).filter(
+            abs(col("z_score")) > 3
+        ).withColumn(
+            "anomaly_id",
+            md5(concat_ws("|", col("tenant_id"), col("hour"), col("z_score")))
+        )
+
+        # Deduplicar por anomaly_id
+        df_deduplicated_anomalies = df_anomalies.dropDuplicates(["anomaly_id"])
+
+        # Escrever
+        df_deduplicated_anomalies.write.mode("overwrite") \
+            .parquet("/data/forge/anomalies")
+        ```
+
+        ---
+
+        ### Etapa 8: SLA Violations
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `tenant_id + service_id + hour + violation_id`
+        **Implementação:** Idêntica à Etapa 7
+
+        ---
+
+        ### Etapa 9: Enriquecimento Deployment
+        **Chave de deduplicação:** `event_id`
+        **Chave natural:** `event_id`
+        **Implementação:**
+        ```python
+        df_with_deployment = df_enriched.join(
+            broadcast_deployment,
+            on=["tenant_id", "service_id"],
+            how="left"
+        )
+
+        # Deduplicar por event_id
+        df_deduplicated = df_with_deployment.dropDuplicates(["event_id"])
+        ```
+
+        ---
+
+        ### Etapa 10: Agregação por Versão
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `window_start + window_end + tenant_id + service_id + version`
+        **Implementação:** Idêntica à Etapa 4
+
+        ---
+
+        ### Etapa 11: Cálculo de Percentis
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `window_start + window_end + tenant_id`
+        **Implementação:** Idêntica à Etapa 4
+
+        ---
+
+        ### Etapa 12: Detecção de Mudança
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `tenant_id + day + change_id`
+        **Implementação:** Idêntica à Etapa 7
+
+        ---
+
+        ### Etapa 13: Agregação para Billing
+        **Chave de deduplicação:** `event_id` (antes de agregação)
+        **Chave natural:** `day + tenant_id`
+        **Implementação:**
+        ```python
+        # Deduplicar por event_id ANTES de contar
+        df_deduplicated = df_normalized.dropDuplicates(["event_id"])
+
+        # Agregar
+        df_billing = df_deduplicated.groupBy(
+            date_trunc("day", col("timestamp")).alias("day"),
+            col("tenant_id")
+        ).agg(
+            count(distinct("event_id")).alias("unique_event_count"),
+            count("*").alias("total_event_count")
+        )
+
+        # Escrever com deduplicação
+        df_billing.write.mode("overwrite") \
+            .partitionBy("day") \
+            .parquet("/data/forge/billing_events")
+        ```
+
+        **Validação:**
+        - [ ] Cada combinação de `(day, tenant_id)` aparece no máximo 1× na saída
+        - [ ] `unique_event_count` é exato (sem duplicatas)
+
+        ---
+
+        ### Etapa 14: Exportação Cerebro
+        **Chave de deduplicação:** `event_id`
+        **Chave natural:** `event_id`
+        **Implementação:**
+        ```python
+        df_for_cerebro = df_enriched.select(
+            col("event_id"),
+            col("tenant_id"),
+            col("service_id"),
+            col("timestamp"),
+            col("metric_name"),
+            col("metric_value"),
+            col("tags"),
+            to_json(struct("*")).alias("json_payload")
+        )
+
+        # Deduplicar por event_id
+        df_deduplicated = df_for_cerebro.dropDuplicates(["event_id"])
+
+        # Escrever para Kafka
+        df_deduplicated.write.format("kafka") \
+            .option("kafka.bootstrap.servers", "<relay-broker>") \
+            .option("topic", "forge-events-indexed") \
+            .mode("append") \
+            .save()
+        ```
+
+        ---
+
+        ## Resumo de Idempotência
+
+        | Etapa | Chave de Dedup | Chave Natural | Método |
+        |-------|----------------|---------------|--------|
+        | 1 | event_id | event_id | dropDuplicates |
+        | 2 | event_id | event_id | dropDuplicates |
+        | 3 | event_id | event_id | dropDuplicates |
+        | 4 | event_id | window + tenant + service | dropDuplicates + groupBy |
+        | 5 | event_id | window + tenant | dropDuplicates + groupBy |
+        | 6 | event_id | window + tenant + service | dropDuplicates + groupBy |
+        | 7 | event_id | tenant + hour + anomaly_id | dropDuplicates + md5 |
+        | 8 | event_id | tenant + service + hour + violation_id | dropDuplicates + md5 |
+        | 9 | event_id | event_id | dropDuplicates |
+        | 10 | event_id | window + tenant + service + version | dropDuplicates + groupBy |
+        | 11 | event_id | window + tenant | dropDuplicates + groupBy |
+        | 12 | event_id | tenant + day + change_id | dropDuplicates + md5 |
+        | 13 | event_id | day + tenant | dropDuplicates + groupBy |
+        | 14 | event_id | event_id | dropDuplicates |
+
+        ---
+
+        ## Teste de Reexecutabilidade
+
+        ```python
+        # Teste: Executar etapa 2× com mesmos dados, validar que resultado é idêntico
+        def test_idempotency(etapa_func, input_df):
+            result_1 = etapa_func(input_df)
+            result_2 = etapa_func(input_df)
+            
+            # Comparar
+            assert result_1.count() == result_2.count(), "Row count mismatch"
+            assert result_1.exceptAll(result_2).count() == 0, "Data mismatch"
+            print("✅ Idempotência validada")
+
+        # Teste: Executar etapa com dados duplicados, validar que resultado é idêntico
+        def test_deduplication(etapa_func, input_df):
+            # Duplicar dados
+            input_df_duplicated = input_df.union(input_df)
+            
+            result_original = etapa_func(input_df)
+            result_duplicated = etapa_func(input_df_duplicated)
+            
+            # Comparar
+            assert result_original.count() == result_duplicated.count(), "Deduplication failed"
+            print("✅ Deduplicação validada")
+        ```
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que idempotência está documentada
+        grep -E "Chave de deduplicação:|Chave natural:" forge/config/idempotency-strategy.md | wc -l
+        # Esperado: > 26 linhas (2 por etapa × 14 etapas)
+        ```
+
+        ---
+
+        ## 5. Indique quais etapas não fazem sentido em streaming
+
+        **Ação:** Justifique por que Etapas 7, 8, 12 permanecem em batch.
+
+        **Onde:** Arquivo `forge/docs/batch-vs-streaming-decision.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Decisão: Quais Etapas Permanecem em Batch
+
+        ## Resumo Executivo
+        Das 14 etapas, 11 são adequadas para streaming (latência de 30 s).
+        3 etapas (7, 8, 12) permanecem em batch (1× por hora ou 1× por dia) porque requerem estado histórico grande.
+
+        ## Análise Detalhada
+
+        ### Etapas Adequadas para Streaming (11 etapas)
+
+        #### Etapas 1, 3, 14: Sem Estado
+        - **Razão:** Não dependem de histórico ou lookup
+        - **Latência:** < 1 s por evento
+        - **Estado:** Nenhum
+        - **Decisão:** ✅ Streaming
+
+        #### Etapas 4, 5, 10, 11, 13: Agregação por Janela
+        - **Razão:** Janelas de 30 s (ou 1 dia para billing) são viáveis em streaming
+        - **Latência:** 30 s (ou 1 dia para billing)
+        - **Estado:** Pequeno (buffer de 30 s de eventos)
+        - **Decisão:** ✅ Streaming
+
+        #### Etapas 2, 6, 9: Enriquecimento por Lookup
+        - **Razão:** Lookup é feito via broadcast de snapshot diário
+        - **Latência:** < 1 s por evento
+        - **Estado:** Pequeno (10–100 MB de broadcast)
+        - **Decisão:** ✅ Streaming (com snapshot atualizado 1× por dia)
+
+        ---
+
+        ### Etapas Inadequadas para Streaming (3 etapas)
+
+        #### Etapa 7: Detecção de Anomalia
+        **Problema:** Requer histórico de 24 horas
+        - **Tamanho de estado:** ~1 GB (1000 tenants × 24 horas × 50 KB/hora)
+        - **Latência de estado:** Manter 24 horas de dados em RocksDB é caro
+        - **Custo:** CPU/memória para manter estado grande
+        - **Alternativa:** Executar em batch 1× por hora (ou 1× por dia)
+
+        **Análise de Trade-off:**
+        ```
+        Streaming:
+        - Latência: 30 s (anomalias detectadas em tempo real)
+        - Custo: Alto (1 GB de estado, CPU para manter)
+        - Complexidade: Alta (gerenciar estado em RocksDB)
+
+        Batch (1× por hora):
+        - Latência: 60 min (anomalias detectadas a cada hora)
+        - Custo: Baixo (job rápido, sem estado persistente)
+        - Complexidade: Baixa (lógica simples)
+
+        Batch (1× por dia):
+        - Latência: 24 horas (anomalias detectadas 1× por dia)
+        - Custo: Muito baixo (job rápido)
+        - Complexidade: Muito baixa
+
+        Decisão: ❌ Batch 1× por hora (trade-off entre latência e custo)
+        ```
+
+        **Justificativa:**
+        - Anomalias são alertas; latência de 1 hora é aceitável
+        - Custo de manter 1 GB de estado em streaming é alto
+        - Batch 1× por hora é mais simples e barato
+
+        ---
+
+        #### Etapa 8: SLA Violations
+        **Problema:** Requer histórico de 24 horas + deduplicação
+        - **Tamanho de estado:** ~500 MB (1000 tenants × 100 serviços × 24 horas × 20 bytes)
+        - **Latência de estado:** Manter 24 horas de dados em RocksDB é caro
+        - **Custo:** CPU/memória para manter estado grande
+        - **Alternativa:** Executar em batch 1× por hora (ou 1× por dia)
+
+        **Análise de Trade-off:**
+        ```
+        Streaming:
+        - Latência: 30 s (violações detectadas em tempo real)
+        - Custo: Alto (500 MB de estado, CPU para manter)
+        - Complexidade: Alta (gerenciar estado em RocksDB)
+
+        Batch (1× por hora):
+        - Latência: 60 min (violações detectadas a cada hora)
+        - Custo: Baixo (job rápido, sem estado persistente)
+        - Complexidade: Baixa (lógica simples)
+
+        Decisão: ❌ Batch 1× por hora (trade-off entre latência e custo)
+        ```
+
+        **Justificativa:**
+        - SLA violations são alertas; latência de 1 hora é aceitável
+        - Custo de manter 500 MB de estado em streaming é alto
+        - Batch 1× por hora é mais simples e barato
+
+        ---
+
+        #### Etapa 12: Detecção de Mudança de Comportamento
+        **Problema:** Requer histórico de 7 dias
+        - **Tamanho de estado:** ~7 GB (1000 tenants × 7 dias × 1 MB/dia)
+        - **Latência de estado:** Manter 7 dias de dados em RocksDB é muito caro
+        - **Custo:** CPU/memória para manter estado muito grande
+        - **Alternativa:** Executar em batch 1× por dia
+
+        **Análise de Trade-off:**
+        ```
+        Streaming:
+        - Latência: 30 s (mudanças detectadas em tempo real)
+        - Custo: Muito alto (7 GB de estado, CPU para manter)
+        - Complexidade: Muito alta (gerenciar estado em RocksDB)
+
+        Batch (1× por dia):
+        - Latência: 24 horas (mudanças detectadas 1× por dia)
+        - Custo: Muito baixo (job rápido, sem estado persistente)
+        - Complexidade: Muito baixa
+
+        Decisão: ❌ Batch 1× por dia (estado é muito grande para streaming)
+        ```
+
+        **Justificativa:**
+        - Detecção de mudança é análise; latência de 24 horas é aceitável
+        - Custo de manter 7 GB de estado em streaming é proibitivo
+        - Batch 1× por dia é a única opção viável
+
+        ---
+
+        ## Resumo de Decisão
+
+        | Etapa | Tipo | Streaming? | Razão | Alternativa |
+        |-------|------|-----------|-------|-------------|
+        | 1 | Parsing | ✅ Sim | Sem estado | — |
+        | 2 | Lookup | ✅ Sim | Broadcast pequeno (10 MB) | — |
+        | 3 | Normalização | ✅ Sim | Sem estado | — |
+        | 4 | Agregação | ✅ Sim | Janela de 30 s | — |
+        | 5 | Agregação | ✅ Sim | Janela de 30 s | — |
+        | 6 | Lookup | ✅ Sim | Broadcast pequeno (50 MB) | — |
+        | 7 | Anomalia | ❌ Não | Estado de 1 GB | Batch 1× por hora |
+        | 8 | SLA Violations | ❌ Não | Estado de 500 MB | Batch 1× por hora |
+        | 9 | Lookup | ✅ Sim | Broadcast pequeno (100 MB) | — |
+        | 10 | Agregação | ✅ Sim | Janela de 30 s | — |
+        | 11 | Percentis | ✅ Sim | Janela de 30 s | — |
+        | 12 | Mudança | ❌ Não | Estado de 7 GB | Batch 1× por dia |
+        | 13 | Billing | ✅ Sim | Janela de 1 dia | — |
+        | 14 | Exportação | ✅ Sim | Sem estado | — |
+
+        ---
+
+        ## Arquitetura Híbrida: Streaming + Batch
+
+        ```
+        Relay (eventos contínuos)
+        ↓
+        Forge Streaming (11 etapas, latência 30 s)
+        ├─ Etapas 1, 3, 14: Parsing, Normalização, Exportação
+        ├─ Etapas 2, 6, 9: Enriquecimento (broadcast)
+        ├─ Etapas 4, 5, 10, 11, 13: Agregação (janelas)
+        ↓
+        DW (tabelas: by_service, aggregated, by_version, percentiles, billing_events)
+        ↓
+        Sentinel, Cerebro, Pepper (consumem dados a cada 30 s)
+
+        Forge Batch (3 etapas, latência 1h–24h)
+        ├─ Etapa 7: Detecção de Anomalia (1× por hora)
+        ├─ Etapa 8: SLA Violations (1× por hora)
+        ├─ Etapa 12: Detecção de Mudança (1× por dia)
+        ↓
+        DW (tabelas: anomalies, sla_violations, behavior_changes)
+        ↓
+        Sentinel, Cerebro (consumem dados a cada hora/dia)
+        ```
+
+        ---
+
+        ## Implicações para Consumidores
+
+        ### Sentinel
+        - Dados de agregação chegam a cada 30 s (streaming)
+        - Dados de anomalia chegam a cada hora (batch)
+        - Dados de SLA violations chegam a cada hora (batch)
+        - Dashboard mostra dados em tempo real (agregação) + alertas a cada hora (anomalia/SLA)
+
+        ### Cerebro
+        - Eventos chegam a cada 30 s (streaming)
+        - Índice é atualizado continuamente
+        - Buscas retornam dados quase em tempo real
+
+        ### Pepper
+        - Dados de billing chegam continuamente (streaming)
+        - Relatório roda 1× por dia (02:00 UTC)
+        - Completude ≥ 99.9% garantida
+
+        ---
+
+        ## Validação
+
+        - [ ] Etapas 1–6, 9–11, 13–14 são implementadas em streaming
+        - [ ] Etapas 7–8 são implementadas em batch (1× por hora)
+        - [ ] Etapa 12 é implementada em batch (1× por dia)
+        - [ ] Consumidores conseguem lidar com latência diferente (30 s vs 1h vs 24h)
+        - [ ] Testes de equivalência validam que streaming + batch = batch original
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que decisão está documentada
+        grep -E "Streaming\?|Razão|Alternativa" forge/docs/batch-vs-streaming-decision.md | wc -l
+        # Esperado: > 30 linhas
+        ```
+
+        ---
+
+        ## 6. Defina estratégia de testes por etapa
+
+        **Ação:** Crie plano de testes para validar cada etapa em streaming vs batch.
+
+        **Onde:** Arquivo `forge/tests/transformation-tests.md` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```markdown
+        # Estratégia de Testes — Transformações Streaming vs Batch
+
+        ## Objetivo
+        Validar que cada etapa de streaming produz resultados equivalentes ao batch.
+
+        ## Estrutura de Testes
+
+        ### Teste 1: Teste Unitário (Por Etapa)
+        **Objetivo:** Validar lógica de transformação isoladamente
+        **Dados:** Dados de teste pequenos (100–1000 eventos)
+        **Validação:** Comparar saída com resultado esperado
+
+        #### Etapa 1: Parsing
+        ```python
+        def test_parsing():
+            # Dados de entrada
+            input_data = [
+                {"event_id": "evt-1", "tenant_id": "t1", "timestamp": 1000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 42},
+                {"event_id": "evt-2", "tenant_id": "t1", "timestamp": 2000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 50},
+                {"event_id": None, "tenant_id": "t1", "timestamp": 3000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 60},  # Inválido
+            ]
+            
+            # Executar etapa
+            df_input = spark.createDataFrame(input_data)
+            df_output = parse_events(df_input)
+            
+            # Validar
+            assert df_output.count() == 2, "Deve filtrar eventos inválidos"
+            assert df_output.filter(col("event_id").isNull()).count() == 0, "Não deve ter event_id nulo"
+            print("✅ Teste de parsing passou")
+
+        # Executar
+        test_parsing()
+        ```
+
+        #### Etapa 4: Agregação por Serviço
+        ```python
+        def test_aggregation_by_service():
+            # Dados de entrada
+            input_data = [
+                {"event_id": "evt-1", "tenant_id": "t1", "service_id": "s1", "timestamp": 1000, "metric_value": 10},
+                {"event_id": "evt-2", "tenant_id": "t1", "service_id": "s1", "timestamp": 2000, "metric_value": 20},
+                {"event_id": "evt-3", "tenant_id": "t1", "service_id": "s2", "timestamp": 3000, "metric_value": 30},
+            ]
+            
+            # Executar etapa
+            df_input = spark.createDataFrame(input_data)
+            df_output = aggregate_by_service(df_input)
+            
+            # Validar
+            assert df_output.count() == 2, "Deve ter 2 agregações (s1, s2)"
+            s1_agg = df_output.filter(col("service_id") == "s1").collect()[0]
+            assert s1_agg["total_value"] == 30, "SUM deve ser 30"
+            assert s1_agg["event_count"] == 2, "COUNT deve ser 2"
+            assert s1_agg["avg_value"] == 15, "AVG deve ser 15"
+            print("✅ Teste de agregação passou")
+
+        # Executar
+        test_aggregation_by_service()
+        ```
+
+        ---
+
+        ### Teste 2: Teste de Integração (Etapas Encadeadas)
+        **Objetivo:** Validar que múltiplas etapas funcionam juntas
+        **Dados:** Dados de teste médios (10k eventos)
+        **Validação:** Comparar saída com resultado esperado
+
+        ```python
+        def test_integration_parsing_to_aggregation():
+            # Dados de entrada (10k eventos)
+            input_data = generate_test_events(10000)
+            
+            # Executar pipeline
+            df_input = spark.createDataFrame(input_data)
+            df_parsed = parse_events(df_input)
+            df_normalized = normalize_metrics(df_parsed)
+            df_aggregated = aggregate_by_service(df_normalized)
+            
+            # Validar
+            assert df_aggregated.count() > 0, "Deve ter agregações"
+            assert df_aggregated.filter(col("event_count") == 0).count() == 0, "event_count não pode ser 0"
+            print("✅ Teste de integração passou")
+
+        # Executar
+        test_integration_parsing_to_aggregation()
+        ```
+
+        ---
+
+        ### Teste 3: Teste de Equivalência (Streaming vs Batch)
+        **Objetivo:** Validar que streaming produz mesmos resultados que batch
+        **Dados:** Dados históricos reais (últimas 24 horas)
+        **Validação:** Comparar saída de streaming com saída de batch
+
+        ```python
+        def test_equivalence_streaming_vs_batch():
+            # Ler dados históricos (últimas 24 horas)
+            df_historical = spark.read.parquet("/data/relay/events_24h")
+            
+            # Executar em batch (modo atual)
+            df_batch_output = run_batch_pipeline(df_historical)
+            
+            # Executar em streaming (modo novo)
+            df_streaming_output = run_streaming_pipeline(df_historical)
+            
+            # Comparar
+            batch_count = df_batch_output.count()
+            streaming_count = df_streaming_output.count()
+            
+            assert batch_count == streaming_count, f"Row count mismatch: batch={batch_count}, streaming={streaming_count}"
+            
+            # Comparar agregações
+            batch_agg = df_batch_output.groupBy("tenant_id", "service_id").agg(
+                sum("total_value").alias("batch_sum"),
+                count("*").alias("batch_count")
+            )
+            streaming_agg = df_streaming_output.groupBy("tenant_id", "service_id").agg(
+                sum("total_value").alias("streaming_sum"),
+                count("*").alias("streaming_count")
+            )
+            
+            comparison = batch_agg.join(streaming_agg, on=["tenant_id", "service_id"], how="outer")
+            mismatches = comparison.filter(
+                (col("batch_sum") != col("streaming_sum")) |
+                (col("batch_count") != col("streaming_count"))
+            ).count()
+            
+            assert mismatches == 0, f"Mismatches encontrados: {mismatches}"
+            print("✅ Teste de equivalência passou")
+
+        # Executar
+        test_equivalence_streaming_vs_batch()
+        ```
+
+        ---
+
+        ### Teste 4: Teste de Idempotência
+        **Objetivo:** Validar que executar etapa 2× produz mesmo resultado
+        **Dados:** Dados de teste pequenos (1000 eventos)
+        **Validação:** Comparar saída de 1× com saída de 2×
+
+        ```python
+        def test_idempotency():
+            # Dados de entrada
+            input_data = generate_test_events(1000)
+            df_input = spark.createDataFrame(input_data)
+            
+            # Executar 1×
+            df_output_1 = aggregate_by_service(df_input)
+            
+            # Executar 2×
+            df_output_2 = aggregate_by_service(df_input)
+            
+            # Comparar
+            assert df_output_1.count() == df_output_2.count(), "Row count mismatch"
+            assert df_output_1.exceptAll(df_output_2).count() == 0, "Data mismatch"
+            print("✅ Teste de idempotência passou")
+
+        # Executar
+        test_idempotency()
+        ```
+
+        ---
+
+        ### Teste 5: Teste de Deduplicação
+        **Objetivo:** Validar que duplicatas são removidas
+        **Dados:** Dados com duplicatas (2000 eventos, 1000 únicos)
+        **Validação:** Comparar saída com dados únicos
+
+        ```python
+        def test_deduplication():
+            # Dados de entrada (com duplicatas)
+            input_data = generate_test_events(1000)
+            input_data_duplicated = input_data + input_data  # Duplicar
+            
+            df_input = spark.createDataFrame(input_data_duplicated)
+            
+            # Executar etapa
+            df_output = parse_events(df_input)
+            
+            # Validar
+            assert df_output.count() == 1000, "Deve remover duplicatas"
+            print("✅ Teste de deduplicação passou")
+
+        # Executar
+        test_deduplication()
+        ```
+
+        ---
+
+        ### Teste 6: Teste de Latência
+        **Objetivo:** Validar que latência está dentro do SLO
+        **Dados:** Dados de teste (10k eventos)
+        **Validação:** Medir latência p95 e comparar com SLO (120 s)
+
+        ```python
+        def test_latency():
+            # Dados de entrada
+            input_data = generate_test_events(10000)
+            df_input = spark.createDataFrame(input_data)
+            
+            # Medir latência
+            start_time = time.time()
+            df_output = run_streaming_pipeline(df_input)
+            end_time = time.time()
+            
+            latency_ms = (end_time - start_time) * 1000
+            
+            # Validar
+            assert latency_ms < 120000, f"Latência {latency_ms}ms excede SLO de 120s"
+            print(f"✅ Teste de latência passou: {latency_ms}ms")
+
+        # Executar
+        test_latency()
+        ```
+
+        ---
+
+        ### Teste 7: Teste de Completude
+        **Objetivo:** Validar que nenhum evento é perdido
+        **Dados:** Dados históricos reais (últimas 24 horas)
+        **Validação:** Comparar contagem de eventos no Relay vs DW
+
+        ```python
+        def test_completeness():
+            # Contar eventos no Relay
+            relay_count = spark.read.parquet("/data/relay/events_24h").count()
+            
+            # Executar pipeline
+            df_output = run_streaming_pipeline(...)
+            
+            # Contar eventos na saída
+            output_count = df_output.count()
+            
+            # Validar
+            completeness = (output_count / relay_count) * 100
+            assert completeness >= 99.9, f"Completude {completeness}% abaixo do SLO de 99.9%"
+            print(f"✅ Teste de completude passou: {completeness}%")
+
+        # Executar
+        test_completeness()
+        ```
+
+        ---
+
+        ## Plano de Execução de Testes
+
+        ### Fase 1: Testes Unitários (Semana 1)
+        - [ ] Teste 1: Parsing
+        - [ ] Teste 1: Normalização
+        - [ ] Teste 1: Agregação por Serviço
+        - [ ] Teste 1: Agregação Global
+        - [ ] Teste 1: Cálculo de Percentis
+        - [ ] Teste 1: Exportação Cerebro
+
+        ### Fase 2: Testes de Integração (Semana 2)
+        - [ ] Teste 2: Parsing → Normalização → Agregação
+        - [ ] Teste 2: Parsing → Enriquecimento → Agregação
+        - [ ] Teste 2: Pipeline completo (14 etapas)
+
+        ### Fase 3: Testes de Equivalência (Semana 3)
+        - [ ] Teste 3: Streaming vs Batch (últimas 24 horas)
+        - [ ] Teste 3: Streaming vs Batch (últimas 7 dias)
+        - [ ] Teste 3: Streaming vs Batch (últimas 30 dias)
+
+        ### Fase 4: Testes de Propriedades (Semana 4)
+        - [ ] Teste 4: Idempotência
+        - [ ] Teste 5: Deduplicação
+        - [ ] Teste 6: Latência
+        - [ ] Teste 7: Completude
+
+        ### Fase 5: Testes em Staging (Semana 5)
+        - [ ] Deploy em staging
+        - [ ] Teste com dados reais (últimas 24 horas)
+        - [ ] Validação com Sentinel, Cerebro, Pepper
+        - [ ] Teste de rollback
+
+        ---
+
+        ## Critérios de Sucesso
+
+        | Teste | Critério | Alvo |
+        |-------|----------|------|
+        | Unitário | Todos os testes passam | 100% |
+        | Integração | Todos os testes passam | 100% |
+        | Equivalência | Completude ≥ 99.9%, Corretude 100% | ✅ |
+        | Idempotência | Resultado é idêntico em 2× execução | ✅ |
+        | Deduplicação | Duplicatas são removidas | ✅ |
+        | Latência | p95 ≤ 120 s | ✅ |
+        | Completude | ≥ 99.9% de eventos processados | ✅ |
+
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Confirmar que testes estão documentados
+        grep -E "def test_|Teste [0-9]" forge/tests/transformation-tests.md | wc -l
+        # Esperado: > 20 linhas
+        ```
+
+        ---
+
+        ## 7. Crie código de transformação streaming para Etapas 1–6, 9–11, 13–14
+
+        **Ação:** Implemente código Spark Structured Streaming para etapas adequadas.
+
+        **Onde:** Arquivo `forge/jobs/streaming_transform.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Forge Streaming Transformation Job
+        Implementa as 11 etapas de transformação em streaming.
+        """
+
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, from_json, schema_of_json, window, count, sum as spark_sum,
+            from_unixtime, to_timestamp, expr, regexp_replace, when, abs,
+            percentile_approx, date_trunc, distinct, md5, concat_ws, to_json, struct,
+            current_timestamp, lit
+        )
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, MapType
+        import logging
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        # Configuração
+        RELAY_BROKER = "<relay-broker>"  # [SUPOSIÇÃO]
+        RELAY_TOPIC = "forge-events-raw"
+        CONSUMER_GROUP = "forge-streaming-v1"
+        CHECKPOINT_BASE_DIR = "/data/forge/checkpoint"
+        OUTPUT_BASE_DIR = "/data/forge"
+
+        # Schema do evento
+        EVENT_SCHEMA = StructType([
+            StructField("event_id", StringType(), False),
+            StructField("tenant_id", StringType(), False),
+            StructField("timestamp", LongType(), False),
+            StructField("service_id", StringType(), False),
+            StructField("metric_name", StringType(), False),
+            StructField("metric_value", DoubleType(), False),
+            StructField("tags", MapType(StringType(), StringType()), True),
+        ])
+
+        class ForgeStreamingTransform:
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            # ========== Etapa 1: Parsing ==========
+            def stage_1_parsing(self, df_raw):
+                """Etapa 1: Parsing e validação de eventos"""
+                self.logger.info("Etapa 1: Parsing")
+                
+                df_parsed = df_raw.select(
+                    col("key").cast(StringType()).alias("partition_key"),
+                    from_json(col("value").cast(StringType()), EVENT_SCHEMA).alias("event"),
+                    col("timestamp").alias("kafka_timestamp")
+                ).select(
+                    col("event.event_id"),
+                    col("event.tenant_id"),
+                    col("event.timestamp"),
+                    col("event.service_id"),
+                    col("event.metric_name"),
+                    col("event.metric_value"),
+                    col("event.tags"),
+                    col("kafka_timestamp")
+                ).filter(
+                    (col("event_id").isNotNull()) &
+                    (col("tenant_id").isNotNull()) &
+                    (col("timestamp").isNotNull())
+                )
+                
+                # Deduplicar por event_id
+                df_deduplicated = df_parsed.dropDuplicates(["event_id"])
+                
+                return df_deduplicated
+            
+            # ========== Etapa 2: Enriquecimento Tenant ==========
+            def stage_2_enrich_tenant(self, df_parsed, broadcast_tenant_meta):
+                """Etapa 2: Enriquecimento com metadados de tenant"""
+                self.logger.info("Etapa 2: Enriquecimento Tenant")
+                
+                df_enriched = df_parsed.join(
+                    broadcast_tenant_meta,
+                    on="tenant_id",
+                    how="left"
+                ).select(
+                    col("event_id"),
+                    col("tenant_id"),
+                    col("tenant_name"),
+                    col("tenant_tier"),
+                    col("region"),
+                    col("timestamp"),
+                    col("service_id"),
+                    col("metric_name"),
+                    col("metric_value"),
+                    col("tags")
+                ).filter(col("tenant_name").isNotNull())
+                
+                # Deduplicar
+                df_deduplicated = df_enriched.dropDuplicates(["event_id"])
+                
+                return df_deduplicated
+            
+            # ========== Etapa 3: Normalização ==========
+            def stage_3_normalize(self, df_enriched):
+                """Etapa 3: Normalização de métrica"""
+                self.logger.info("Etapa 3: Normalização")
+                
+                df_normalized = df_enriched.withColumn(
+                    "metric_name_normalized",
+                    regexp_replace(col("metric_name"), r"[.-]", "_")
+                ).withColumn(
+                    "metric_value_normalized",
+                    when(col("metric_name").contains("latency"), col("metric_value") / 1000)
+                    .otherwise(col("metric_value"))
+                ).select(
+                    col("event_id"),
+                    col("tenant_id"),
+                    col("tenant_name"),
+                    col("tenant_tier"),
+                    col("region"),
+                    col("timestamp"),
+                    col("service_id"),
+                    col("metric_name_normalized").alias("metric_name"),
+                    col("metric_value_normalized").alias("metric_value"),
+                    col("tags")
+                )
+                
+                # Deduplicar
+                df_deduplicated = df_normalized.dropDuplicates(["event_id"])
+                
+                return df_deduplicated
+            
+            # ========== Etapa 4: Agregação por Serviço ==========
+            def stage_4_aggregate_by_service(self, df_normalized):
+                """Etapa 4: Agregação por serviço (janela 30 s)"""
+                self.logger.info("Etapa 4: Agregação por Serviço")
+                
+                # Converter timestamp (ms) para timestamp Spark
+                df_with_ts = df_normalized.withColumn(
+                    "event_timestamp",
+                    to_timestamp(col("timestamp") / 1000)
+                )
+                
+                # Aplicar watermark
+                df_watermarked = df_with_ts.withWatermark("event_timestamp", "45 seconds")
+                
+                # Agregar
+                df_by_service = df_watermarked.groupBy(
+                    window(col("event_timestamp"), "30 seconds"),
+                    col("tenant_id"),
+                    col("service_id")
+                ).agg(
+                    spark_sum("metric_value").alias("total_value"),
+                    count("*").alias("event_count"),
+                    expr("avg(metric_value)").alias("avg_value"),
+                    expr("stddev(metric_value)").alias("stddev_value")
+                ).select(
+                    col("window.start").alias("window_start"),
+                    col("window.end").alias("window_end"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("total_value"),
+                    col("event_count"),
+                    col("avg_value"),
+                    col("stddev_value")
+                )
+                
+                return df_by_service
+            
+            # ========== Etapa 5: Agregação Global ==========
+            def stage_5_aggregate_global(self, df_normalized):
+                """Etapa 5: Agregação global (janela 30 s)"""
+                self.logger.info("Etapa 5: Agregação Global")
+                
+                # Converter timestamp
+                df_with_ts = df_normalized.withColumn(
+                    "event_timestamp",
+                    to_timestamp(col("timestamp") / 1000)
+                )
+                
+                # Aplicar watermark
+                df_watermarked = df_with_ts.withWatermark("event_timestamp", "45 seconds")
+                
+                # Agregar
+                df_aggregated = df_watermarked.groupBy(
+                    window(col("event_timestamp"), "30 seconds"),
+                    col("tenant_id")
+                ).agg(
+                    spark_sum("metric_value").alias("total_value"),
+                    count("*").alias("event_count"),
+                    expr("avg(metric_value)").alias("avg_value")
+                ).select(
+                    col("window.start").alias("window_start"),
+                    col("window.end").alias("window_end"),
+                    col("tenant_id"),
+                    col("total_value"),
+                    col("event_count"),
+                    col("avg_value")
+                )
+                
+                return df_aggregated
+            
+            # ========== Etapa 6: Taxa de Erro ==========
+            def stage_6_error_rates(self, df_by_service, broadcast_sla):
+                """Etapa 6: Cálculo de taxa de erro"""
+                self.logger.info("Etapa 6: Taxa de Erro")
+                
+                df_error_rates = df_by_service.filter(
+                    col("metric_name") == "error"
+                ).join(
+                    broadcast_sla,
+                    on=["tenant_id", "service_id"],
+                    how="left"
+                ).withColumn(
+                    "error_rate",
+                    col("total_value") / col("event_count")
+                ).withColumn(
+                    "sla_breached",
+                    col("error_rate") > col("sla_threshold")
+                )
+                
+                return df_error_rates
+            
+            # ========== Etapa 9: Enriquecimento Deployment ==========
+            def stage_9_enrich_deployment(self, df_enriched, broadcast_deployment):
+                """Etapa 9: Enriquecimento com deployment info"""
+                self.logger.info("Etapa 9: Enriquecimento Deployment")
+                
+                df_with_deployment = df_enriched.join(
+                    broadcast_deployment,
+                    on=["tenant_id", "service_id"],
+                    how="left"
+                ).select(
+                    col("event_id"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("version"),
+                    col("region"),
+                    col("environment"),
+                    col("timestamp"),
+                    col("metric_name"),
+                    col("metric_value")
+                )
+                
+                # Deduplicar
+                df_deduplicated = df_with_deployment.dropDuplicates(["event_id"])
+                
+                return df_deduplicated
+            
+            # ========== Etapa 10: Agregação por Versão ==========
+            def stage_10_aggregate_by_version(self, df_with_deployment):
+                """Etapa 10: Agregação por versão (janela 30 s)"""
+                self.logger.info("Etapa 10: Agregação por Versão")
+                
+                # Converter timestamp
+                df_with_ts = df_with_deployment.withColumn(
+                    "event_timestamp",
+                    to_timestamp(col("timestamp") / 1000)
+                )
+                
+                # Aplicar watermark
+                df_watermarked = df_with_ts.withWatermark("event_timestamp", "45 seconds")
+                
+                # Agregar
+                df_by_version = df_watermarked.groupBy(
+                    window(col("event_timestamp"), "30 seconds"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("version")
+                ).agg(
+                    spark_sum("metric_value").alias("total_value"),
+                    count("*").alias("event_count"),
+                    expr("avg(metric_value)").alias("avg_value")
+                ).select(
+                    col("window.start").alias("window_start"),
+                    col("window.end").alias("window_end"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("version"),
+                    col("total_value"),
+                    col("event_count"),
+                    col("avg_value")
+                )
+                
+                return df_by_version
+            
+            # ========== Etapa 11: Cálculo de Percentis ==========
+            def stage_11_percentiles(self, df_aggregated):
+                """Etapa 11: Cálculo de percentis (janela 30 s)"""
+                self.logger.info("Etapa 11: Cálculo de Percentis")
+                
+                # Converter timestamp
+                df_with_ts = df_aggregated.withColumn(
+                    "event_timestamp",
+                    to_timestamp(col("timestamp") / 1000)
+                )
+                
+                # Aplicar watermark
+                df_watermarked = df_with_ts.withWatermark("event_timestamp", "45 seconds")
+                
+                # Calcular percentis
+                df_percentiles = df_watermarked.groupBy(
+                    window(col("event_timestamp"), "30 seconds"),
+                    col("tenant_id")
+                ).agg(
+                    percentile_approx("metric_value", 0.5).alias("p50"),
+                    percentile_approx("metric_value", 0.95).alias("p95"),
+                    percentile_approx("metric_value", 0.99).alias("p99")
+                ).select(
+                    col("window.start").alias("window_start"),
+                    col("window.end").alias("window_end"),
+                    col("tenant_id"),
+                    col("p50"),
+                    col("p95"),
+                    col("p99")
+                )
+                
+                return df_percentiles
+            
+            # ========== Etapa 13: Agregação para Billing ==========
+            def stage_13_billing(self, df_normalized):
+                """Etapa 13: Agregação para billing (janela 1 dia)"""
+                self.logger.info("Etapa 13: Agregação para Billing")
+                
+                # Deduplicar por event_id ANTES de contar
+                df_deduplicated = df_normalized.dropDuplicates(["event_id"])
+                
+                # Converter timestamp
+                df_with_ts = df_deduplicated.withColumn(
+                    "event_timestamp",
+                    to_timestamp(col("timestamp") / 1000)
+                )
+                
+                # Aplicar watermark (24 horas)
+                df_watermarked = df_with_ts.withWatermark("event_timestamp", "24 hours")
+                
+                # Agregar por dia
+                df_billing = df_watermarked.groupBy(
+                    window(col("event_timestamp"), "1 day"),
+                    col("tenant_id")
+                ).agg(
+                    count(distinct("event_id")).alias("unique_event_count"),
+                    count("*").alias("total_event_count")
+                ).select(
+                    col("window.start").alias("day_start"),
+                    col("window.end").alias("day_end"),
+                    col("tenant_id"),
+                    col("unique_event_count"),
+                    col("total_event_count")
+                )
+                
+                return df_billing
+            
+            # ========== Etapa 14: Exportação Cerebro ==========
+            def stage_14_export_cerebro(self, df_enriched):
+                """Etapa 14: Exportação para Cerebro"""
+                self.logger.info("Etapa 14: Exportação Cerebro")
+                
+                df_for_cerebro = df_enriched.select(
+                    col("event_id"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("timestamp"),
+                    col("metric_name"),
+                    col("metric_value"),
+                    col("tags"),
+                    to_json(struct("*")).alias("json_payload")
+                )
+                
+                # Deduplicar
+                df_deduplicated = df_for_cerebro.dropDuplicates(["event_id"])
+                
+                return df_deduplicated
+            
+            # ========== Pipeline Completo ==========
+            def run_pipeline(self, df_raw, broadcast_tenant_meta, broadcast_sla, broadcast_deployment):
+                """Executa pipeline completo"""
+                self.logger.info("Iniciando pipeline de transformação")
+                
+                # Etapa 1: Parsing
+                df_parsed = self.stage_1_parsing(df_raw)
+                
+                # Etapa 2: Enriquecimento Tenant
+                df_enriched = self.stage_2_enrich_tenant(df_parsed, broadcast_tenant_meta)
+                
+                # Etapa 3: Normalização
+                df_normalized = self.stage_3_normalize(df_enriched)
+                
+                # Etapa 4: Agregação por Serviço
+                df_by_service = self.stage_4_aggregate_by_service(df_normalized)
+                
+                # Etapa 5: Agregação Global
+                df_aggregated = self.stage_5_aggregate_global(df_normalized)
+                
+                # Etapa 6: Taxa de Erro
+                df_error_rates = self.stage_6_error_rates(df_by_service, broadcast_sla)
+                
+                # Etapa 9: Enriquecimento Deployment
+                df_with_deployment = self.stage_9_enrich_deployment(df_enriched, broadcast_deployment)
+                
+                # Etapa 10: Agregação por Versão
+                df_by_version = self.stage_10_aggregate_by_version(df_with_deployment)
+                
+                # Etapa 11: Cálculo de Percentis
+                df_percentiles = self.stage_11_percentiles(df_aggregated)
+                
+                # Etapa 13: Agregação para Billing
+                df_billing = self.stage_13_billing(df_normalized)
+                
+                # Etapa 14: Exportação Cerebro
+                df_for_cerebro = self.stage_14_export_cerebro(df_enriched)
+                
+                self.logger.info("Pipeline de transformação concluído")
+                
+                return {
+                    "by_service": df_by_service,
+                    "aggregated": df_aggregated,
+                    "error_rates": df_error_rates,
+                    "by_version": df_by_version,
+                    "percentiles": df_percentiles,
+                    "billing": df_billing,
+                    "cerebro": df_for_cerebro
+                }
+
+        def create_spark_session():
+            """Cria sessão Spark com configurações otimizadas"""
+            return SparkSession.builder \
+                .appName("forge-streaming-transform") \
+                .config("spark.streaming.kafka.maxRatePerPartition", "2000") \
+                .config("spark.streaming.kafka.maxOffsetsPerTrigger", "2000") \
+                .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_BASE_DIR) \
+                .config("spark.sql.streaming.schemaInference", "false") \
+                .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = create_spark_session()
+            
+            # Ler do Relay
+            df_raw = spark.readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                .option("subscribe", RELAY_TOPIC) \
+                .option("startingOffsets", "earliest") \
+                .option("kafka.group.id", CONSUMER_GROUP) \
+                .load()
+            
+            # Carregar broadcasts (snapshots diários)
+            df_tenant_meta = spark.read.parquet("/data/tenant_metadata")
+            broadcast_tenant_meta = broadcast(df_tenant_meta)
+            
+            df_sla = spark.read.parquet("/data/sla_config")
+            broadcast_sla = broadcast(df_sla)
+            
+            df_deployment = spark.read.parquet("/data/deployment_info")
+            broadcast_deployment = broadcast(df_deployment)
+            
+            # Executar pipeline
+            transformer = ForgeStreamingTransform(spark)
+            outputs = transformer.run_pipeline(df_raw, broadcast_tenant_meta, broadcast_sla, broadcast_deployment)
+            
+            # Escrever saídas
+            queries = []
+            
+            # Escrever by_service
+            query_by_service = outputs["by_service"].writeStream \
+                .format("parquet") \
+                .option("path", f"{OUTPUT_BASE_DIR}/by_service") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/by_service") \
+                .outputMode("update") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            queries.append(query_by_service)
+            
+            # Escrever aggregated
+            query_aggregated = outputs["aggregated"].writeStream \
+                .format("parquet") \
+                .option("path", f"{OUTPUT_BASE_DIR}/aggregated") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/aggregated") \
+                .outputMode("update") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            queries.append(query_aggregated)
+            
+            # Escrever by_version
+            query_by_version = outputs["by_version"].writeStream \
+                .format("parquet") \
+                .option("path", f"{OUTPUT_BASE_DIR}/by_version") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/by_version") \
+                .outputMode("update") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            queries.append(query_by_version)
+            
+            # Escrever percentiles
+            query_percentiles = outputs["percentiles"].writeStream \
+                .format("parquet") \
+                .option("path", f"{OUTPUT_BASE_DIR}/percentiles") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/percentiles") \
+                .outputMode("update") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            queries.append(query_percentiles)
+            
+            # Escrever billing
+            query_billing = outputs["billing"].writeStream \
+                .format("parquet") \
+                .option("path", f"{OUTPUT_BASE_DIR}/billing_events") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/billing") \
+                .outputMode("update") \
+                .trigger(processingTime="1 hour") \
+                .start()
+            queries.append(query_billing)
+            
+            # Escrever cerebro
+            query_cerebro = outputs["cerebro"].writeStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", RELAY_BROKER) \
+                .option("topic", "forge-events-indexed") \
+                .option("checkpointLocation", f"{CHECKPOINT_BASE_DIR}/cerebro") \
+                .outputMode("append") \
+                .trigger(processingTime="30 seconds") \
+                .start()
+            queries.append(query_cerebro)
+            
+            # Aguardar término
+            spark.streams.awaitAnyTermination()
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar job em modo local
+        spark-submit \
+            --master local[4] \
+            --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0 \
+            forge/jobs/streaming_transform.py
+        # Esperado: job inicia e começa a processar eventos
+        ```
+
+        ---
+
+        ## 8. Crie código de transformação batch para Etapas 7, 8, 12
+
+        **Ação:** Implemente código Spark batch para etapas que permanecem em batch.
+
+        **Onde:** Arquivo `forge/jobs/batch_transform_anomalies.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Forge Batch Transformation Job — Anomalies, SLA Violations, Behavior Changes
+        Implementa as 3 etapas que permanecem em batch.
+        Executado 1× por hora (Etapas 7, 8) ou 1× por dia (Etapa 12).
+        """
+
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import (
+            col, window, count, sum as spark_sum, avg, stddev, abs,
+            date_trunc, md5, concat_ws, lit, current_timestamp
+        )
+        import logging
+        from datetime import datetime, timedelta
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        # Configuração
+        DW_PATH = "/data/forge"
+        OUTPUT_PATH = "/data/forge"
+
+        class ForgeAnomalyDetection:
+            def __init__(self, spark):
+                self.spark = spark
+                self.logger = logger
+            
+            # ========== Etapa 7: Detecção de Anomalia ==========
+            def stage_7_anomaly_detection(self, lookback_hours=24):
+                """Etapa 7: Detecção de anomalia (histórico de 24h)"""
+                self.logger.info(f"Etapa 7: Detecção de Anomalia (últimas {lookback_hours}h)")
+                
+                # Ler agregações dos últimos 24 horas
+                cutoff_time = datetime.utcnow() - timedelta(hours=lookback_hours)
+                df_aggregated = self.spark.read.parquet(f"{DW_PATH}/aggregated") \
+                    .filter(col("window_start") >= cutoff_time)
+                
+                # Calcular estatísticas por tenant
+                df_stats = df_aggregated.groupBy("tenant_id").agg(
+                    avg("total_value").alias("mean_value"),
+                    stddev("total_value").alias("stddev_value"),
+                    count("*").alias("sample_count")
+                )
+                
+                # Detectar anomalias (z-score > 3)
+                df_anomalies = df_aggregated.join(
+                    df_stats,
+                    on="tenant_id"
+                ).withColumn(
+                    "z_score",
+                    (col("total_value") - col("mean_value")) / col("stddev_value")
+                ).filter(
+                    abs(col("z_score")) > 3
+                ).withColumn(
+                    "anomaly_id",
+                    md5(concat_ws("|", col("tenant_id"), col("window_start"), col("z_score")))
+                ).select(
+                    col("window_start"),
+                    col("window_end"),
+                    col("tenant_id"),
+                    col("total_value"),
+                    col("mean_value"),
+                    col("stddev_value"),
+                    col("z_score"),
+                    col("anomaly_id"),
+                    lit(datetime.utcnow()).alias("detection_time")
+                )
+                
+                # Deduplicar por anomaly_id
+                df_deduplicated = df_anomalies.dropDuplicates(["anomaly_id"])
+                
+                # Escrever
+                df_deduplicated.write.mode("overwrite") \
+                    .parquet(f"{OUTPUT_PATH}/anomalies")
+                
+                self.logger.info(f"Anomalias detectadas: {df_deduplicated.count()}")
+                return df_deduplicated
+            
+            # ========== Etapa 8: SLA Violations ==========
+            def stage_8_sla_violations(self, lookback_hours=24):
+                """Etapa 8: Detecção de SLA violations (histórico de 24h)"""
+                self.logger.info(f"Etapa 8: SLA Violations (últimas {lookback_hours}h)")
+                
+                # Ler agregações por serviço dos últimos 24 horas
+                cutoff_time = datetime.utcnow() - timedelta(hours=lookback_hours)
+                df_by_service = self.spark.read.parquet(f"{DW_PATH}/by_service") \
+                    .filter(col("window_start") >= cutoff_time)
+                
+                # Ler SLA config
+                df_sla = self.spark.read.parquet("/data/sla_config")
+                
+                # Calcular taxa de erro
+                df_error_rates = df_by_service.filter(
+                    col("metric_name") == "error"
+                ).join(
+                    df_sla,
+                    on=["tenant_id", "service_id"],
+                    how="left"
+                ).withColumn(
+                    "error_rate",
+                    col("total_value") / col("event_count")
+                ).withColumn(
+                    "sla_breached",
+                    col("error_rate") > col("sla_threshold")
+                )
+                
+                # Detectar violações
+                df_violations = df_error_rates.filter(
+                    col("sla_breached") == True
+                ).withColumn(
+                    "violation_id",
+                    md5(concat_ws("|", col("tenant_id"), col("service_id"), col("window_start")))
+                ).select(
+                    col("window_start"),
+                    col("window_end"),
+                    col("tenant_id"),
+                    col("service_id"),
+                    col("error_rate"),
+                    col("sla_threshold"),
+                    col("violation_id"),
+                    lit(datetime.utcnow()).alias("detection_time")
+                )
+                
+                # Deduplicar por violation_id
+                df_deduplicated = df_violations.dropDuplicates(["violation_id"])
+                
+                # Escrever
+                df_deduplicated.write.mode("overwrite") \
+                    .parquet(f"{OUTPUT_PATH}/sla_violations")
+                
+                self.logger.info(f"Violações detectadas: {df_deduplicated.count()}")
+                return df_deduplicated
+            
+            # ========== Etapa 12: Detecção de Mudança de Comportamento ==========
+            def stage_12_behavior_changes(self, lookback_days=7):
+                """Etapa 12: Detecção de mudança de comportamento (histórico de 7 dias)"""
+                self.logger.info(f"Etapa 12: Detecção de Mudança (últimos {lookback_days} dias)")
+                
+                # Ler agregações dos últimos 7 dias
+                cutoff_time = datetime.utcnow() - timedelta(days=lookback_days)
+                df_aggregated = self.spark.read.parquet(f"{DW_PATH}/aggregated") \
+                    .filter(col("window_start") >= cutoff_time)
+                
+                # Calcular baseline (média dos últimos 7 dias)
+                df_baseline = df_aggregated.groupBy("tenant_id").agg(
+                    avg("total_value").alias("baseline_value"),
+                    count("*").alias("sample_count")
+                )
+                
+                # Detectar mudanças (> 50% de desvio)
+                df_changes = df_aggregated.join(
+                    df_baseline,
+                    on="tenant_id"
+                ).withColumn(
+                    "change_pct",
+                    abs(col("total_value") - col("baseline_value")) / col("baseline_value") * 100
+                ).filter(
+                    col("change_pct") > 50
+                ).withColumn(
+                    "change_id",
+                    md5(concat_ws("|", col("tenant_id"), col("window_start"), col("change_pct")))
+                ).select(
+                    col("window_start"),
+                    col("window_end"),
+                    col("tenant_id"),
+                    col("total_value"),
+                    col("baseline_value"),
+                    col("change_pct"),
+                    col("change_id"),
+                    lit(datetime.utcnow()).alias("detection_time")
+                )
+                
+                # Deduplicar por change_id
+                df_deduplicated = df_changes.dropDuplicates(["change_id"])
+                
+                # Escrever
+                df_deduplicated.write.mode("overwrite") \
+                    .parquet(f"{OUTPUT_PATH}/behavior_changes")
+                
+                self.logger.info(f"Mudanças detectadas: {df_deduplicated.count()}")
+                return df_deduplicated
+
+        def create_spark_session():
+            """Cria sessão Spark"""
+            return SparkSession.builder \
+                .appName("forge-batch-anomalies") \
+                .getOrCreate()
+
+        def main():
+            """Função principal"""
+            spark = create_spark_session()
+            
+            detector = ForgeAnomalyDetection(spark)
+            
+            # Executar Etapas 7 e 8 (1× por hora)
+            logger.info("Executando Etapas 7 e 8 (1× por hora)")
+            detector.stage_7_anomaly_detection(lookback_hours=24)
+            detector.stage_8_sla_violations(lookback_hours=24)
+            
+            # Executar Etapa 12 (1× por dia)
+            logger.info("Executando Etapa 12 (1× por dia)")
+            detector.stage_12_behavior_changes(lookback_days=7)
+            
+            logger.info("Batch job concluído")
+
+        if __name__ == "__main__":
+            main()
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Testar job em modo local
+        spark-submit \
+            --master local[4] \
+            forge/jobs/batch_transform_anomalies.py
+        # Esperado: job executa e escreve resultados
+        ```
+
+        ---
+
+        ## 9. Crie testes de equivalência (streaming vs batch)
+
+        **Ação:** Implemente testes que comparam saída de streaming com saída de batch.
+
+        **Onde:** Arquivo `forge/tests/test_equivalence.py` (novo) no repositório do Forge.
+
+        **Procedimento:**
+
+        ```python
+        #!/usr/bin/env python3
+        """
+        Testes de Equivalência: Streaming vs Batch
+        Valida que streaming produz mesmos resultados que batch.
+        """
+
+        import pytest
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import col, count, sum as spark_sum, avg
+        from datetime import datetime, timedelta
+        import logging
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
+        @pytest.fixture(scope="session")
+        def spark():
+            """Cria sessão Spark para testes"""
+            return SparkSession.builder \
+                .appName("forge-equivalence-tests") \
+                .master("local[4]") \
+                .getOrCreate()
+
+        class TestEquivalence:
+            """Testes de equivalência entre streaming e batch"""
+            
+            def test_parsing_equivalence(self, spark):
+                """Teste: Parsing (Etapa 1) produz mesmos resultados"""
+                logger.info("Teste: Parsing Equivalence")
+                
+                # Dados de entrada
+                input_data = [
+                    {"event_id": "evt-1", "tenant_id": "t1", "timestamp": 1000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 42},
+                    {"event_id": "evt-2", "tenant_id": "t1", "timestamp": 2000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 50},
+                    {"event_id": None, "tenant_id": "t1", "timestamp": 3000, "service_id": "s1", "metric_name": "http.requests", "metric_value": 60},
+                ]
+                
+                df_input = spark.createDataFrame(input_data)
+                
+                # Executar parsing
+                df_output = df_input.filter(col("event_id").isNotNull())
+                
+                # Validar
+                assert df_output.count() == 2, "Deve filtrar eventos inválidos"
+                assert df_output.filter(col("event_id").isNull()).count() == 0
+                logger.info("✅ Teste de parsing passou")
+            
+            def test_aggregation_equivalence(self, spark):
+                """Teste: Agregação (Etapa 4) produz mesmos resultados"""
+                logger.info("Teste: Aggregation Equivalence")
+                
+                # Dados de entrada
+                input_data = [
+                    {"event_id": "evt-1", "tenant_id": "t1", "service_id": "s1", "timestamp": 1000, "metric_value": 10},
+                    {"event_id": "evt-2", "tenant_id": "t1", "service_id": "s1", "timestamp": 2000, "metric_value": 20},
+                    {"event_id": "evt-3", "tenant_id": "t1", "service_id": "s2", "timestamp": 3000, "metric_value": 30},
+                ]
+                
+                df_input = spark.createDataFrame(input_data)
+                
+                # Agregar
+                df_output = df_input.groupBy("tenant_id", "service_id").agg(
+                    spark_sum("metric_value").alias("total_value"),
+                    count("*").alias("event_count"),
+                    avg("metric_value").alias("avg_value")
+                )
+                
+                # Validar
+                assert df_output.count() == 2, "Deve ter 2 agregações"
+                s1_agg = df_output.filter(col("service_id") == "s1").collect()[0]
+                assert s1_agg["total_value"] == 30, "SUM deve ser 30"
+                assert s1_agg["event_count"] == 2, "COUNT deve ser 2"
+                assert s1_agg["avg_value"] == 15, "AVG deve ser 15"
+                logger.info("✅ Teste de agregação passou")
+            
+            def test_deduplication_equivalence(self, spark):
+                """Teste: Deduplicação remove duplicatas"""
+                logger.info("Teste: Deduplication Equivalence")
+                
+                # Dados de entrada (com duplicatas)
+                input_data = [
+                    {"event_id": "evt-1", "tenant_id": "t1", "metric_value": 10},
+                    {"event_id": "evt-1", "tenant_id": "t1", "metric_value": 10},  # Duplicata
+                    {"event_id": "evt-2", "tenant_id": "t1", "metric_value": 20},
+                ]
+                
+                df_input = spark.createDataFrame(input_data)
+                
+                # Deduplicar
+                df_output = df_input.dropDuplicates(["event_id"])
+                
+                # Validar
+                assert df_output.count() == 2, "Deve remover duplicatas"
+                logger.info("✅ Teste de deduplicação passou")
+            
+            def test_completeness_equivalence(self, spark):
+                """Teste: Completude (nenhum evento é perdido)"""
+                logger.info("Teste: Completeness Equivalence")
+                
+                # Dados de entrada
+                input_data = [
+                    {"event_id": f"evt-{i}", "tenant_id": "t1", "metric_value": i}
+                    for i in range(1000)
+                ]
+                
+                df_input = spark.createDataFrame(input_data)
+                
+                # Processar
+                df_output = df_input.filter(col("event_id").isNotNull())
+                
+                # Validar
+                input_count = df_input.count()
+                output_count = df_output.count()
+                completeness = (output_count / input_count) * 100
+                
+                assert completeness >= 99.9, f"Completude {completeness}% abaixo do SLO"
+                logger.info(f"✅ Teste de completude passou: {completeness}%")
+            
+            def test_idempotency_equivalence(self, spark):
+                """Teste: Idempotência (executar 2× produz mesmo resultado)"""
+                logger.info("Teste: Idempotency Equivalence")
+                
+                # Dados de entrada
+                input_data = [
+                    {"event_id": f"evt-{i}", "tenant_id": "t1", "metric_value": i}
+                    for i in range(100)
+                ]
+                
+                df_input = spark.createDataFrame(input_data)
+                
+                # Executar 1×
+                df_output_1 = df_input.filter(col("event_id").isNotNull())
+                
+                # Executar 2×
+                df_output_2 = df_input.filter(col("event_id").isNotNull())
+                
+                # Validar
+                assert df_output_1.count() == df_output_2.count(), "Row count mismatch"
+                assert df_output_1.exceptAll(df_output_2).count() == 0, "Data mismatch"
+                logger.info("✅ Teste de idempotência passou")
+
+        if __name__ == "__main__":
+            pytest.main([__file__, "-v"])
+        ```
+
+        **Verificação:**
+
+        ```bash
+        # Executar testes
+        pytest forge/tests/test_equivalence.py -v
+        # Esperado: todos os testes passam
+        ```
+
+        ---
+
+        ## X. Ponto de não-retorno
+
+        **Ponto de não-retorno:** Após o passo 7 (deploy do código de transformação em staging), o Forge começa a processar eventos em streaming.
+
+        **Por quê:** Uma vez que o job de streaming está rodando e escrevendo no DW, voltar atrás requer:
+        1. Parar o job de streaming
+        2. Limpar dados parciais do DW
+        3. Reexecutar batch para recuperar dados
+        4. Validar equivalência novamente
+
+        **Mitigação:** Antes do passo 7, executar testes completos em staging (passos 6–9).
+
+        ---
+
+        ## Y. Rollback
+
+        **Procedimento de rollback (se necessário após passo 7):**
+
+        ```bash
+        #!/bin/bash
+        # Script de rollback: voltar para batch
+        set -e
+
+        echo "=== Rollback: Forge Streaming → Batch ==="
+
+        # 1. Parar job de streaming
+        echo "1. Parando job de streaming..."
+        kubectl delete deployment forge-streaming-transform -n forge
+
+        # 2. Limpar dados parciais do DW
+        echo "2. Limpando dados parciais do DW..."
+        # [SUPOSIÇÃO] usar SQL para remover dados de streaming
+        # DELETE FROM forge_events_aggregated WHERE source = 'streaming'
+
+        # 3. Ativar job de batch
+        echo "3. Ativando job de batch..."
+        # [SUPOSIÇÃO] job de batch é ativado via Airflow/cron
+        airflow dags trigger forge-batch-transform
+
+        # 4. Validar que batch está processando
+        echo "4. Validando que batch está processando..."
+        sleep 60
+        airflow dags list | grep forge-batch-transform
+
+        echo "=== Rollback concluído ==="
+        ```
+
+        ---
+
+        ## Z. Critérios de conclusão
+
+        - [ ] **Mapeamento:** 14 etapas mapeadas e classificadas (11 streaming, 3 batch)
+        - [ ] **Janelas:** Estratégia de janelas, watermarks e late events documentada (5 etapas com agregação)
+        - [ ] **Estado:** Tamanho e TTL de estado definidos (6 etapas com estado)
+        - [ ] **Idempotência:** Chave de deduplicação e chave natural definidas (14 etapas)
+        - [ ] **Decisão batch:** Justificativa para Etapas 7, 8, 12 permanecerem em batch
+        - [ ] **Testes:** Estratégia de testes documentada (7 tipos de testes)
+        - [ ] **Código streaming:** Implementado para Etapas 1–6, 9–11, 13–14 (`streaming_transform.py`)
+        - [ ] **Código batch:** Implementado para Etapas 7, 8, 12 (`batch_transform_anomalies.py`)
+        - [ ] **Testes de equivalência:** Implementados (`test_equivalence.py`)
+        - [ ] **Documentação:** Todos os arquivos criados e verificados
+        - [ ] **Suposições:** Todas marcadas com `[SUPOSIÇÃO]` e justificadas
+        - [ ] **Dados faltantes:** Lista de confirmações necessárias documentada
+
+        ---
+
+        ## W. Riscos e mitigação
+
+        | Risco | Probabilidade | Impacto | Mitigação |
+        |-------|---------------|--------|-----------|
+        | Tamanho de estado em RocksDB excede limite (> 10 GB) | Média | Alto | Manter Etapas 7, 8, 12 em batch; monitorar tamanho de estado |
+        | Latência de streaming excede SLO (> 120 s p95) | Média | Alto | Aumentar paralelismo; otimizar transformações; testar em staging |
+        | Completude < 99.9% (eventos perdidos) | Baixa | Alto | Implementar deduplicação; validar com testes de equivalência |
+        | Consumidores não conseguem lidar com modo `update` (atualização retroativa) | Média | Médio | Testar com Sentinel, Cerebro, Pepper; ajustar queries se necessário |
+        | Broadcast de lookup é muito grande (> 100 MB) | Baixa | Médio | Particionar broadcast; usar state store em vez de broadcast |
+        | Snapshot de lookup fica desatualizado (> 24h) | Baixa | Médio | Implementar recarregamento automático a cada 24h |
+        | Etapas 7, 8, 12 em batch causam latência inaceitável | Baixa | Médio | Aumentar frequência de batch (1× por hora em vez de 1× por dia) |
+        | Testes de equivalência falham (streaming ≠ batch) | Média | Alto | Investigar causa raiz; ajustar transformações; revalidar |
+        | Código de streaming tem bugs (ex: off-by-one em agregação) | Média | Alto | Testes unitários rigorosos; validação com dados reais em staging |
+        | Rollback é necessário (streaming não é viável) | Baixa | Alto | Procedimento de rollback documentado; dados de batch preservados |
+
+        ---
+
+        ## Dados faltantes e confirmações necessárias
+
+        ### Dados que faltam:
+        1. **Código exato do batch:** Qual é o código atual das 14 etapas? (Necessário para validar equivalência)
+        2. **Schema das tabelas de saída:** Qual é o schema exato de cada tabela? (Necessário para validar corretude)
+        3. **Tamanho real de estado por tenant:** Qual é o maior tenant em termos de volume? (Necessário para dimensionar RocksDB)
+        4. **Distribuição de latência real:** Qual é a distribuição real de latência de eventos? (Necessário para ajustar watermark)
+        5. **Custo de RocksDB:** Qual é o custo de manter 1 GB de estado em RocksDB? (Necessário para trade-off streaming vs batch)
+        6. **Frequência de atualização de lookup:** Com que frequência metadados de tenant/SLA/deployment mudam? (Necessário para definir TTL)
+        7. **Capacidade de Sentinel/Cerebro/Pepper:** Conseguem processar dados a cada 30 s? (Necessário para validar com consumidores)
+
+        ### Confirmações que derrubariam/validariam escolhas futuras:
+        - Se **tamanho de estado > 10 GB**, manter Etapas 7, 8, 12 em batch (confirmado)
+        - Se **latência p95 > 120 s**, aumentar paralelismo ou otimizar transformações
+        - Se **completude < 99.9%**, investigar causa raiz e ajustar deduplicação
+        - Se **consumidores não conseguem lidar com modo `update`**, usar modo `append` com reprocessamento
+        - Se **broadcast > 100 MB**, particionar ou usar state store
+        - Se **snapshot fica desatualizado**, implementar recarregamento automático
+        - Se **testes de equivalência falham**, investigar e ajustar transformações
+
+        ---
+
+        ## Suposições marcadas
+
+        | # | Suposição | Razão | Confirmação necessária |
+        |---|-----------|-------|------------------------|
+        | [SUPOSIÇÃO-1] | 11 etapas são adequadas para streaming | Baseado em análise de estado | Validar com testes de equivalência |
+        | [SUPOSIÇÃO-2] | 3 etapas (7, 8, 12) permanecem em batch | Tamanho de estado é grande | Confirmar tamanho real de estado |
+        | [SUPOSIÇÃO-3] | Janela de 30 s é viável | Alinha com intervalo de processamento | Validar latência em staging |
+        | [SUPOSIÇÃO-4] | Watermark de 45 s é suficiente | 1.5× p99 latência | Coletar distribuição real de latência |
+        | [SUPOSIÇÃO-5] | Allowed lateness de 60 s é aceitável | Margem adicional de 15 s | Validar com consumidores |
+        | [SUPOSIÇÃO-6] | Broadcast de 10–100 MB é viável | Típico em Spark | Confirmar tamanho real de metadados |
+        | [SUPOSIÇÃO-7] | TTL de 24 h para lookup é suficiente | Metadados mudam raramente | Confirmar frequência de mudança |
+        | [SUPOSIÇÃO-8] | Modo `update` é aceitável para consumidores | Permite atualização retroativa | Testar com Sentinel, Cerebro, Pepper |
+        | [SUPOSIÇÃO-9] | Deduplicação por `event_id` é suficiente | Chave única por evento | Validar que `event_id` é único |
+        | [SUPOSIÇÃO-10] | Percentis aproximados são aceitáveis | `percentile_approx()` é rápido | Validar precisão com dados reais |
+
+        ---
+
+        ## Próximos passos (Etapa 5)
+
+        Após conclusão desta etapa, o redesenho das transformações alimentará:
+        - **Etapa 5:** Validação de equivalência (batch vs streaming) com dados históricos
+        - **Etapa 6:** Prototipagem em staging com dados reais
+        - **Etapa 7–10:** Migração gradual com canary, validação de consumidores, rollback
