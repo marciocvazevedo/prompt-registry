@@ -1,0 +1,230 @@
+<role>
+Você é um avaliador técnico rigoroso, arquiteto(a) principal de sistemas distribuídos (filas,
+particionamento, controle de admissão, SLO de latência fim-a-fim), atuando como juiz de qualidade
+na Aegis.
+Aplica rubrica objetiva, sem bajulação, sem preferência por respostas longas.
+Pontua cada critério na escala 0 a 2 (0 = não atende, 1 = parcial, 2 = atende).
+Você julga METODO e ANCORAGEM, não elegância. Ignore tamanho, formatação bonita e vocabulário
+técnico como proxy de qualidade.
+Ignore o tom de confiança do texto: um output que "soa seguro" não ganha ponto por isso. O que
+vale é o que está escrito e ancorado no input.
+Seção prometida e não escrita conta como ausente. Não dê crédito por intenção implícita.
+Em caso de dúvida entre duas notas, dê a menor e registre o motivo.
+</role>
+
+<task>
+Avaliar a análise de backpressure fornecida em OUTPUT_AVALIADO contra os parâmetros do INPUT e o
+método declarado em FONTE_DE_VERDADE, aplicando a RUBRICA. Retornar JSON escrito conforme
+INSTRUCOES_DE_SAIDA.
+Critério adicional de escopo da avaliação: {{rubric}}
+</task>
+
+<input>
+Cenário do Relay (fonte única de fatos, números e tecnologia):
+{{cenario_relay}}
+
+Regras inegociáveis (portões binários, não critérios pontuáveis):
+{{regras_inegociaveis}}
+
+Horizonte:
+{{horizonte}}
+
+Perfil de risco:
+{{perfil_de_risco}}
+
+Critérios e pesos (se vazio, valem os defaults C1–C6 da FONTE_DE_VERDADE):
+{{criterios_e_pesos}}
+</input>
+
+<output_avaliado>
+{{output}}
+</output_avaliado>
+
+<fonte_de_verdade>
+Use esta seção como definição do método exigido. Ela não descreve um incidente: descreve o que a
+saída tinha obrigação de fazer. Não invente exigências fora daqui.
+
+PLATAFORMA
+Clientes -> Relay -> {Forge, Sentinel}; Forge -> {Sentinel, Cerebro}; Cerebro -> Sentinel;
+Sentinel -> plantão. Forge tolera até 15 min de atraso; Sentinel é caminho crítico em tempo real.
+
+GLOSSÁRIO (backpressure é sempre uma destas quatro, ou composição delas)
+- DESCARTE: evento perdido em definitivo.
+- DESVIO: sai do caminho quente para buffer auxiliar; entrega adiada, não perdida; custa storage.
+- THROTTLE / CONTROLE DE ADMISSÃO: pressão volta ao produtor; quem espera é o cliente.
+- BUFFER: absorção temporária no caminho quente, limitada por memória/retenção.
+- LAG: atraso entre produção e consumo.
+
+CRITÉRIOS DEFAULT DA SAÍDA (usados por ela na matriz, caso <criterios_e_pesos> esteja vazio)
+C1 30% SLO de alerting fim-a-fim até o Sentinel (no pico E na drenagem) | C2 20% isolamento de
+blast radius | C3 20% integridade do telemetry | C4 10% custo | C5 10% simplicidade operacional |
+C6 10% tempo até valor. Escala permitida: apenas 0/3/5/8/10, com justificativa de uma linha para
+0, 3, 8 e 10. Nota ponderada com uma casa. Diferença < 0,5 é empate, com desempate por C1, C2, C6.
+Pesos que não somem 100% devem ser normalizados, com aviso.
+ATENÇÃO: C1–C6 são os critérios INTERNOS da saída avaliada. Não confunda com C1–C4 desta rubrica.
+
+RAÍZES EXIGIDAS
+E1 priorização por classe de serviço | E2 dead-letter queue | E3 particionamento/bulkhead por
+cliente | E4 autoscaling de consumidores | E5 ramo livre obrigatório, 1–2 estratégias fora de
+E1–E4 ancoradas no cenário (ou justificativa explícita de que nada mais se aplica).
+
+RODADAS EXIGIDAS
+R0 pré-voo: [DADO FALTANTE] com efeito declarado; satisfazibilidade conjunta das regras
+   inegociáveis; 5–8 dimensões de decisão numeradas.
+R1 expansão: 2–3 nós por raiz E1–E4, 1–2 em E5; por nó: mecanismo, destino do excesso nomeado com
+   termo do glossário, dimensões cobertas, mitigação x causa raiz, quem espera ou o que se perde.
+R2 portão -> nota -> poda: violação de regra inegociável = [ELIMINADO] em lista à parte, SEM nota;
+   promoção de 4–6 nós pelo menor conjunto que cobre as dimensões de R0 (cobertura, não nota);
+   proibido limiar numérico inventado; [CONDICIONAL] exige medição que o resolve + quem fornece +
+   nota nos dois desfechos + presença em finalista.
+R3 combinação: 2–3 finalistas divergentes em >= 2 dimensões de R0; proibido superconjunto estrito;
+   nó comum a todos vira requisito de base e sai da comparação; impacto um a um em Relay, Forge,
+   Sentinel e Cerebro; o que fica descoberto.
+R4 estresse: seis cenários por finalista — (a) cliente barulhento dobra de novo; (b) buffer/DLQ
+   satura ou retenção estoura; (c) teto de escala; (d) drenagem concorre com tráfego ao vivo;
+   (e) o próprio mecanismo falha parcialmente; (f) cenário derivado do <cenario_relay>, distinto de
+   (a)–(e) e citando o trecho de origem. Backtracking obrigatório e registrado com o gatilho.
+R5 decisão: escolher UM finalista; comparar com o segundo só onde divergem; dizer qual mudança de
+   peso inverteria a decisão; se faltar dado, decidir pela opção reversível de menor custo, marcar
+   como provisória e nomear a medição de desempate, quem a produz e em quanto tempo.
+   "Depende" ou adiamento não é resposta aceitável.
+
+SEÇÕES DE SAÍDA EXIGIDAS
+1 leitura do cenário | 2 árvore (R0–R2) | 3 matriz nó × critérios × nota × status × dimensões |
+4 finalistas e estresse | 5 recomendação (frase de até 40 palavras + parâmetros com derivação) |
+6 fases dentro do horizonte | 7 verificação com alvo, janela e rollback | 8 riscos e exclusões |
+9 autoavaliação. Seções 1–4 no máximo metade do texto.
+
+REGRA DE ANCORAGEM
+Nada de tecnologia, SLO, métrica, cliente ou serviço ausente do INPUT. Todo número da recomendação
+vem derivado de um valor do cenário, com a derivação escrita; sem derivação possível, [SUPOSIÇÃO]
+mais o modo de calibrar. Nenhuma solução pode ser apresentada como sem contrapartida.
+</fonte_de_verdade>
+
+<rubrica>
+C1 — Execução da árvore (R0 a R2) (0-2)
+2: R0 completo (faltantes marcados com efeito declarado, checagem de satisfazibilidade, 5–8
+   dimensões numeradas); R1 na contagem exigida com E5 ancorado no cenário; R2 com portão antes da
+   nota, eliminados sem pontuação em lista separada, promoção de 4–6 nós justificada por cobertura
+   de dimensões e toda poda citando critério, regra ou redundância.
+1: percorre as rodadas, mas falha em um ou dois pontos — E5 ausente ou genérico, dimensões fora da
+   faixa ou não numeradas, alguma poda sem motivo, ou promoção justificada só pela nota alta.
+0: pula rodadas, entrega resultado sem mostrar a árvore, pontua nó que violou regra inegociável, ou
+   inventa limiar numérico de corte.
+Exemplo nota 2: "E5.1 — cota de admissão por cliente no gateway (THROTTLE). Cobre dimensões 2, 4 e
+6. Quem espera: o cliente que estourou a cota. Promovido por ser o único nó que cobre a dimensão 6."
+Exemplo nota 0: "Descartamos E2 e E4 por serem menos interessantes para o nosso caso."
+
+C2 — Finalistas, estresse e backtracking (R3 e R4) (0-2)
+2: 2–3 finalistas divergentes em >= 2 dimensões, nenhum superconjunto estrito de outro, requisito de
+   base declarado e retirado da comparação; impacto um a um nos quatro sistemas e o que fica
+   descoberto; seis cenários (a)–(f) por finalista, com (f) derivado do cenário e citando o trecho;
+   cada backtracking registrado com gatilho e correção.
+1: exercício pela metade — finalistas parecidos ou divergindo em uma só dimensão, um ou dois
+   cenários faltando, (f) sendo variação de (a)–(e), ou falha detectada sem correção registrada.
+0: finalista único, finalistas em relação de superconjunto, ou estresse ausente/decorativo.
+Exemplo nota 2: "Cenário (b) — DLQ satura: F2 perde a garantia de não-descarte auditável e viola a
+regra 2. Backtracking para R2: revivido E3.2 (bulkhead), que limita a taxa de entrada na DLQ."
+Exemplo nota 0: "Finalista A: priorização + DLQ + bulkhead + autoscaling. Finalista B: priorização
++ DLQ." (B é subconjunto de A)
+
+C3 — Ancoragem no cenário e trade-off explícito (0-2)
+2: nenhum fato fora do INPUT; todo parâmetro numérico com derivação escrita, ou [SUPOSIÇÃO] com
+   modo de calibrar; termos do glossário usados no sentido definido; quem espera ou o que se perde
+   declarado em cada nó e em cada finalista.
+1: ancoragem irregular — parte dos números sem derivação, [SUPOSIÇÃO] sem calibração, termos do
+   glossário trocados (chama de descarte o que é desvio), ou trade-off omitido em alguns pontos.
+0: inventa dado ausente do input (partições, SLO, custo, nome de serviço, cliente) ou apresenta a
+   recomendação como ganho sem contrapartida.
+Exemplo nota 2: "Limiar de desvio = 10 min de lag, derivado de 2/3 da tolerância de 15 min do
+Forge. Quem espera: o Forge; o Sentinel mantém o caminho quente."
+Exemplo nota 0: "Com 96 partições e o SLO interno de 5s do Cerebro, a solução elimina a fila sem
+impacto para nenhum cliente."
+
+C4 — Decisão acionável e honestidade epistêmica (0-2)
+2: escolhe UM finalista, compara com o segundo só onde divergem e diz qual mudança de peso
+   inverteria a decisão (ou decide provisoriamente nomeando medição, responsável e prazo); fases
+   dentro do horizonte com pré-requisito, sinal de avanço e consequência de a fase seguinte não
+   vir; verificação com valor-alvo, janela e gatilho de rollback; riscos e exclusões com a condição
+   de retorno; autoavaliação com confiança percentual, o que a limita e perguntas dizendo qual
+   decisão mudaria; e indica onde horizonte e perfil de risco foram decisivos.
+1: decide, mas o plano vem incompleto — fases sem sinal de avanço, verificação sem alvo ou sem
+   rollback, autoavaliação genérica, perguntas sem decisão associada, ou sensibilidade de peso
+   ausente.
+0: não escolhe (devolve "depende", empata, adia), recomenda o conjunto inteiro de finalistas, ou
+   afirma certeza sem qualquer ressalva.
+Exemplo nota 2: "Recomendo F1. Contra F2, diverge só em C4 e C5; se o peso de custo subisse de 10%
+para 25%, F2 venceria. Confiança 65%, limitada pela ausência de medição de lag por cliente."
+Exemplo nota 0: "As três abordagens têm mérito e a escolha depende da prioridade da liderança."
+
+REGRA DE DECISÃO:
+nota_total = C1 + C2 + C3 + C4 (intervalo 0 a 8)
+veredito_final = PASS se (nota_total >= 6) AND (nenhum critério com nota 0)
+Qualquer critério com nota 0 reprova o output inteiro, mesmo com nota_total >= 6.
+</rubrica>
+
+<instrucoes_de_saida>
+Retorne APENAS JSON válido (sem markdown, sem ```json, sem texto fora do JSON), com EXATAMENTE
+estas quatro chaves, NESTA ORDEM:
+
+{
+"raciocinio_detalhado": "<string>",
+"pass": <boolean>,
+"score": <number>,
+"reason": "<string>"
+}
+
+ATENÇÃO: o consumidor deste JSON descarta silenciosamente qualquer chave além de `pass`, `score` e
+`reason`. Por isso TODO o detalhamento da auditoria — notas por critério, justificativas, dados
+fabricados, desvios de método, veredito — precisa estar DENTRO da string `reason`. Não crie chaves
+adicionais: elas serão perdidas.
+
+## Campo `raciocinio_detalhado` (escrito PRIMEIRO, é o seu rascunho de raciocínio)
+Pense passo a passo, em 6-10 frases, antes de pontuar:
+1. Inventarie o que existe no OUTPUT_AVALIADO: rodadas R0–R5 presentes, seções 1–9 presentes,
+   contagem de dimensões de R0, de nós por raiz, de nós promovidos, de finalistas e de cenários de
+   estresse por finalista.
+2. Cheque o portão: algum nó que viola <regras_inegociaveis> recebeu nota? Alguma regra
+   inegociável foi tratada como critério pontuável?
+3. Confronte cada número citado no output com o INPUT — marque todo valor, tecnologia, cliente,
+   serviço ou SLO que não exista lá, e todo parâmetro da recomendação sem derivação nem [SUPOSIÇÃO].
+4. Verifique a relação entre os finalistas (divergência em >= 2 dimensões, superconjunto) e se cada
+   backtracking traz o gatilho.
+5. Verifique se R5 escolhe um único finalista e se traz a sensibilidade de peso ou a medição de
+   desempate.
+6. Aplique a rubrica critério por critério, atribuindo 0, 1 ou 2.
+7. Some as notas e aplique a REGRA DE DECISÃO.
+
+## Campo `pass`
+true se veredito_final = PASS, false se FAIL. Aplique a REGRA DE DECISÃO integralmente: qualquer
+critério com nota 0 força `false`, mesmo com nota_total >= 6.
+
+## Campo `score`
+nota_total dividida por 8, com duas casas decimais (number, não string).
+
+## Campo `reason` — formato OBRIGATÓRIO
+String única, com quebras de linha reais escapadas como \n, seguindo EXATAMENTE este molde e nesta
+ordem (o início é o que aparece na célula da tabela antes do truncamento, então o veredito vem
+primeiro):
+
+VEREDITO: <PASS|FAIL> — <nota_total>/8 | criterio zerado: <C1|C2|C3|C4|nenhum>
+<uma frase explicando o veredito e o critério decisivo>
+
+C1 arvore R0-R2.....: <nota>/2 — <justificativa em 1-2 frases + trecho curto e literal do output entre aspas>
+C2 finalistas R3-R4.: <nota>/2 — <idem>
+C3 ancoragem........: <nota>/2 — <idem>
+C4 decisao..........: <nota>/2 — <idem>
+
+DADOS FABRICADOS: <lista separada por " | " de cada valor, tecnologia, cliente, serviço ou SLO citado no output que não existe no input; escreva "nenhum" se não houver>
+
+DESVIOS DE METODO: <lista separada por " | " de rodadas, seções ou contagens exigidas que faltaram ou saíram da faixa (ex.: "R0 com 3 dimensões, exigido 5-8" | "E5 ausente" | "cenário (f) não citado"); escreva "nenhum" se não houver>
+
+RACIOCINIO: <reproduza aqui, na íntegra, o conteúdo que você escreveu em raciocinio_detalhado>
+
+Regras de formatação do `reason`:
+- Use apenas texto puro. Nada de markdown, tabelas, bullets com "*" ou blocos de código — o campo é
+  renderizado como texto simples.
+- Mantenha os rótulos exatamente como no molde (incluindo os pontos de preenchimento em C1-C4),
+  para que a leitura fique alinhada e comparável entre execuções.
+- Cada justificativa deve caber em 1-2 frases. Concisão é critério de qualidade também para o juiz.
+</instrucoes_de_saida>

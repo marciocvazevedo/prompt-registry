@@ -1,0 +1,36 @@
+prompts:
+  - file://prompt.md
+providers:
+  - id: anthropic:messages:claude-haiku-4-5-20251001
+    config:
+      max_tokens: 30000
+      stream: true
+      temperature: 0.0
+defaultTest:
+  options:
+    rubricPrompt: file://rubric/judge-backpressure-relay.xml
+    provider:
+      id: openai:gpt-5
+      config:
+        response_format: { type: json_object }
+  assert:
+    - type: llm-rubric
+      value: >
+        Avaliar a análise de backpressure conforme a rubrica C1-C4, a fonte de verdade e a regra de
+        decisão definidos no rubricPrompt.
+      threshold: 0.75
+      metric: avaliacao_juiz_llm
+tests:
+  - vars:
+      CENARIO_RELAY: | 
+        - throughput sustentado: 180k msgs/s
+        - pico observado no incidente da semana passada: 320k msgs/s por 25min
+        - retenção atual: 4h
+        - consumidores: Forge (ingestão), Sentinel (alerting em tempo real)
+      REGRAS_INEGOCIAVEIS: | 
+        - alerting do Sentinel não pode atrasar mais que 60s (SLA com cliente)
+        - ingestão do Forge pode atrasar até 15min sem violar SLA
+        - orçamento de infra do trimestre já está 8% acima do previsto
+        - Steve Rogers lembra que o barramento antigo perdia mensagens sob pico, e perda de telemetry é inaceitável para um produto de observabilidade
+      HORIZONTE: Contenção em 2 semanas; estrutural em 1 trimestre
+      PERFIL_DE_RISCO: Conservador — nada que possa interromper ingestão em produção
