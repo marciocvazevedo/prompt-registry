@@ -1,0 +1,216 @@
+name: Avaliação de prompts (promptfoo)
+
+# Roda em TODO pull request para a main (sem filtro de paths): o job "Veredito promptfoo"
+# é o status check obrigatório da branch, e um workflow que não dispara deixaria o check
+# pendente para sempre em PRs que não tocam prompts. A filtragem acontece no job "detectar".
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promptfoo-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Descobre quais suítes promptfoo são afetadas pelas mudanças do PR
+  # ---------------------------------------------------------------------------
+  detectar:
+    name: Detectar prompts alterados
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.mapa.outputs.suites }}
+      tem_suites: ${{ steps.mapa.outputs.tem_suites }}
+      sem_avaliacao: ${{ steps.mapa.outputs.sem_avaliacao }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Mapear arquivos alterados → suítes promptfoo
+        id: mapa
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "::group::Arquivos alterados no PR"
+          git diff --name-only --diff-filter=d "$BASE_SHA...$HEAD_SHA" | tee alterados.txt
+          echo "::endgroup::"
+
+          python3 .github/scripts/detectar_avaliacoes.py < alterados.txt > mapa.json
+          cat mapa.json
+
+          {
+            echo "suites=$(jq -c '.suites' mapa.json)"
+            echo "tem_suites=$(jq -r '(.suites | length) > 0' mapa.json)"
+            echo "sem_avaliacao=$(jq -c '.sem_avaliacao' mapa.json)"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2) Uma execução da action oficial por suíte afetada (cada uma comenta no PR)
+  # ---------------------------------------------------------------------------
+  avaliar:
+    name: promptfoo · ${{ matrix.suite.pasta }}
+    needs: detectar
+    if: needs.detectar.outputs.tem_suites == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write # a action publica o resultado da suíte como comentário no PR
+    strategy:
+      fail-fast: false # todas as suítes rodam até o fim; o veredito consolida
+      matrix:
+        suite: ${{ fromJSON(needs.detectar.outputs.suites) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Asserts em JavaScript (ex.: asserts/valid-yaml.cjs) fazem require('js-yaml').
+      # O repositório não tem package.json, então instalamos na raiz: o Node resolve
+      # node_modules subindo a árvore a partir da pasta do assert.
+      - name: Instalar dependências dos asserts JavaScript
+        run: npm install --no-save --no-package-lock js-yaml@4
+
+      - name: Cache do promptfoo
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.promptfoo-cache/${{ matrix.suite.id }}
+          key: promptfoo-${{ matrix.suite.id }}-${{ hashFiles(format('{0}/**', matrix.suite.pasta)) }}
+          restore-keys: promptfoo-${{ matrix.suite.id }}-
+
+      - name: Avaliar suíte com promptfoo
+        id: eval
+        uses: promptfoo/promptfoo-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }} # provider avaliado (Claude Haiku)
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}       # gpt-4o-mini e juiz llm-rubric (gpt-5)
+          working-directory: ${{ matrix.suite.pasta }}        # resolve file://prompt.md, ../rubric, asserts/
+          config: promptfooconfig.yaml
+          use-config-prompts: 'true'  # usa exatamente os prompts declarados no config da suíte
+          fail-on-threshold: '100'    # plena conformidade: qualquer teste reprovado ou com erro reprova
+          no-share: 'true'            # não publica prompts/saídas em link público
+          promptfoo-version: ${{ vars.PROMPTFOO_VERSION || 'latest' }}
+          cache-path: ${{ github.workspace }}/.promptfoo-cache/${{ matrix.suite.id }}
+          max-concurrency: '4'
+
+      - name: Registrar resultado da suíte
+        if: always()
+        env:
+          PASTA: ${{ matrix.suite.pasta }}
+          RESULTADO: ${{ steps.eval.outcome }}
+        run: |
+          mkdir -p resultado
+          jq -n --arg pasta "$PASTA" --arg resultado "$RESULTADO" \
+                --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+                '{pasta: $pasta, resultado: $resultado, url: $url}' > "resultado/${{ matrix.suite.id }}.json"
+
+      - name: Publicar resultado para o veredito
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-${{ matrix.suite.id }}
+          path: resultado/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3) Gate único: aprova ou reprova o PR estritamente pelo resultado do promptfoo
+  #    → configure ESTE job como status check obrigatório na branch main
+  # ---------------------------------------------------------------------------
+  veredito:
+    name: Veredito promptfoo
+    needs: [detectar, avaliar]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Baixar resultados das suítes
+        if: needs.detectar.outputs.tem_suites == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: resultado-*
+          path: resultados
+          merge-multiple: true
+
+      - name: Consolidar, comentar no PR e decidir
+        uses: actions/github-script@v7
+        env:
+          DETECTAR: ${{ needs.detectar.result }}
+          SUITES: ${{ needs.detectar.outputs.suites || '[]' }}
+          SEM_AVALIACAO: ${{ needs.detectar.outputs.sem_avaliacao || '[]' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const MARCADOR = '<!-- promptfoo-veredito -->';
+
+            if (process.env.DETECTAR !== 'success') {
+              core.setFailed('A detecção de prompts alterados falhou — não há base para aprovar o PR.');
+              return;
+            }
+
+            const suites = JSON.parse(process.env.SUITES);
+            const semAvaliacao = JSON.parse(process.env.SEM_AVALIACAO);
+
+            const lidos = {};
+            if (fs.existsSync('resultados')) {
+              for (const f of fs.readdirSync('resultados')) {
+                const r = JSON.parse(fs.readFileSync(path.join('resultados', f), 'utf8'));
+                lidos[r.pasta] = r;
+              }
+            }
+
+            const icone = { success: '✅ Aprovado', failure: '❌ Reprovado', cancelled: '⚪ Cancelado', skipped: '⚪ Não executado' };
+            const linhas = suites.map(({ pasta }) => {
+              const r = lidos[pasta];
+              const status = r ? (icone[r.resultado] ?? `⚠️ ${r.resultado}`) : '⚠️ Sem resultado';
+              const link = r ? `[logs](${r.url})` : '—';
+              return { pasta, ok: r?.resultado === 'success', texto: `| \`${pasta}\` | ${status} | ${link} |` };
+            });
+
+            const reprovadas = linhas.filter(l => !l.ok);
+            const aprovado = reprovadas.length === 0 && semAvaliacao.length === 0;
+
+            // Nenhum prompt tocado: nada a avaliar, gate passa sem poluir o PR.
+            if (suites.length === 0 && semAvaliacao.length === 0) {
+              core.info('Nenhum prompt ou artefato de avaliação alterado neste PR.');
+              return;
+            }
+
+            let corpo = `${MARCADOR}\n## ${aprovado ? '✅ Alteração de prompt APROVADA' : '❌ Alteração de prompt REPROVADA'} pelo promptfoo\n\n`;
+            corpo += `Commit avaliado: \`${context.payload.pull_request.head.sha.slice(0, 7)}\` · critério: 100% dos testes de cada suíte afetada devem passar.\n\n`;
+            if (linhas.length) {
+              corpo += '| Suíte | Resultado | Execução |\n|---|---|---|\n' + linhas.map(l => l.texto).join('\n') + '\n\n';
+            }
+            if (semAvaliacao.length) {
+              corpo += '### ⚠️ Prompts alterados sem suíte de avaliação\n';
+              corpo += 'Os arquivos abaixo mudaram, mas nenhum `promptfooconfig.yaml` os cobre. Sem testes, não há como aprovar a alteração — adicione uma suíte promptfoo na pasta do prompt.\n\n';
+              corpo += semAvaliacao.map(p => `- \`${p}\``).join('\n') + '\n\n';
+            }
+            corpo += '_O detalhamento por teste (sucessos/falhas) está nos comentários da promptfoo-action e nos logs de cada suíte._';
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comentarios = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existente = comentarios.find(c => c.body?.includes(MARCADOR));
+            if (existente) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existente.id, body: corpo });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: corpo });
+            }
+            await core.summary.addRaw(corpo.replace(MARCADOR, '')).write();
+
+            if (!aprovado) {
+              core.setFailed(`Reprovado: ${reprovadas.length} suíte(s) com falha e ${semAvaliacao.length} prompt(s) sem avaliação.`);
+            }
