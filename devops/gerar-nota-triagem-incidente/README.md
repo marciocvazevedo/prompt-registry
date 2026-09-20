@@ -1,7 +1,7 @@
 ---
 nome: Gerar Nota de Triagem de Incidente
 descricao: Transforma um alerta de monitoramento em uma nota de triagem de cinco campos (alerta, impacto, hipótese, ação, escalação) para abrir incidentes de plantão.
-versao: 1.0.0
+versao: 1.1.0
 tags: [sre, observabilidade, incidentes, plantão, alertas]
 inputs:
   - nome: MENSAGEM_DE_ALERTA
@@ -56,3 +56,5 @@ ESCALAR PARA: @relay-core se a taxa de 401 não cair abaixo de 1% em 10min
 - Espera o alerta em inglês como entrada; a nota de saída é sempre em português do Brasil.
 - Exige que o alerta traga unidades e limiares mínimos — o próprio prompt proíbe preencher
   lacunas com dados inventados.
+- O campo CONTEXTO_ADICIONAL vazio é tratado da mesma forma que o literal "nenhum" — não é
+  obrigatório preencher com essa palavra, mas ela continua sendo a convenção recomendada.
