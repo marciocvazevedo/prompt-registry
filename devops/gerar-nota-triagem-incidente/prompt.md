@@ -1,7 +1,7 @@
 ---
 nome: Gerar Nota de Triagem de Incidente
 descricao: Transforma um alerta de monitoramento em uma nota de triagem de cinco campos (alerta, impacto, hipótese, ação, escalação) para abrir incidentes de plantão.
-versao: 1.0.0
+versao: 1.1.0
 tags: [sre, observabilidade, incidentes, plantão, alertas]
 inputs:
   - nome: MENSAGEM_DE_ALERTA
@@ -87,7 +87,7 @@ ESCALAR PARA: <@time> se <condição objetiva> em <prazo>
 - Tenant, região, shard, AZ, nó, versão ou horário de deploy, contagem de tenants, severidade, SLO, runbook, componente e limiar contratado só aparecem se estiverem no alerta ou no contexto adicional. Se o alerta não menciona shard, a palavra não entra na nota; se não menciona latência, não afirme degradação de latência. Faltando o dado, reescreva o campo sem ele.
 - A condição do `ESCALAR PARA` ancora no valor observado ou no limiar declarado ("se a rejeição de 6% persistir", "se o lag de 9min seguir crescendo"); sem limiar declarado, use tendência ("não cair", "não estabilizar"). Nunca invente número de corte. O `<prazo>`, esse sim, é decisão do plantão: 10 a 30min conforme a urgência.
 - Os EXEMPLOS são referência de formato e tom, **não de conteúdo**: não reaproveite números (`1%`, `85%`), mecanismos (`JWKS`, `kid`, `trust store`), entidades (`fw-03`, `us-east-1`) nem frases. Número que aparece num exemplo e não no alerta em análise está errado.
-- Contexto adicional pesa como o alerta. Se for `nenhum`, não cite deploys, janelas ou incidentes em curso. Em conflito, prevalece o alerta e a divergência alimenta a hipótese.
+- Contexto adicional pesa como o alerta. Se for `nenhum` ou vier vazio, não cite deploys, janelas ou incidentes em curso. Em conflito, prevalece o alerta e a divergência alimenta a hipótese.
 
 **Autoverificação (interna, antes de exibir)**
 
