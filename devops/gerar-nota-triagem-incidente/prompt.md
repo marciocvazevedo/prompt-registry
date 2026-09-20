@@ -1,7 +1,7 @@
 ---
 nome: Gerar Nota de Triagem de Incidente
 descricao: Transforma um alerta de monitoramento em uma nota de triagem de cinco campos (alerta, impacto, hipótese, ação, escalação) para abrir incidentes de plantão.
-versao: 1.0.0
+versao: 1.1.0
 tags: [sre, observabilidade, incidentes, plantão, alertas]
 inputs:
   - nome: MENSAGEM_DE_ALERTA
@@ -56,20 +56,25 @@ Produza **uma nota de triagem em português do Brasil** no formato de RESULT. Ex
 
 ## RESULT
 
-Produza **apenas** os cinco campos abaixo, nessa ordem, sem preâmbulo, sem comentários, **sem markdown, sem blocos de código, como texto puro**:
+Produza **apenas** os seis campos abaixo, nessa ordem, sem preâmbulo, sem comentários, **sem markdown, sem blocos de código, como texto puro**:
 
 ALERTA: <sistema> - <sintoma objetivo com valor, limiar e janela de tempo>
 IMPACTO: <quem é afetado e de que forma, em termos de negócio>
 HIPÓTESE INICIAL: <causa provável única, verificável>
 AÇÃO IMEDIATA: <o que está sendo feito agora>
 ESCALAR PARA: <@time> se <condição objetiva> em <prazo>
+CHECKLIST:
+- <passo de diagnóstico 1>
+- <passo de diagnóstico 2>
+- <passo de diagnóstico 3>
+- <passo de diagnóstico 4>
 
 (As cercas de código aqui e nos exemplos só delimitam o texto desta especificação; a saída real é texto puro, sem formatação.)
 
 **Forma**
 
 - **Saída é texto puro, sem markdown, sem blocos de código, sem formatação de nenhum tipo.**
-- Uma linha por campo, sem quebras internas nem sublistas.
+- Uma linha por campo, sem quebras internas nem sublistas, exceto `CHECKLIST`, que traz exatamente quatro passos de diagnóstico, um por linha, iniciados por `- `.
 - Português do Brasil; em inglês, apenas o jargão consagrado (`deploy`, `rollback`, `shard`, `lag`, `heap`, `watermark`, `throttling`, `backlog`, nomes de serviços, métricas e ferramentas).
 - 12 a 30 palavras por campo, sem contar o rótulo. Número vence adjetivo: "p99 de 80ms para 950ms", não "muito lento". Decimais com vírgula (`12,4M`); horários em UTC e marcados como tal.
 - Mais de um alerta na mensagem: uma nota por alerta, separadas por linha em branco. RESOLVED/recovery também gera nota, com `AÇÃO IMEDIATA` voltada a validar recuperação e registrar post-mortem.
@@ -91,7 +96,7 @@ ESCALAR PARA: <@time> se <condição objetiva> em <prazo>
 
 **Autoverificação (interna, antes de exibir)**
 
-Saída é texto puro, sem markdown nem blocos de código. Todo dado veio do alerta ou do contexto; nada copiado dos exemplos; ALERTA sem causa; IMPACTO com perda × atraso e silenciosa × visível, sem repetir métrica; hipótese única, com mecanismo e derrubável por verificação concreta; ação com verbo, alvo nomeado e sem condicional; escalação com handle válido e uma condição com prazo (ou `agora`), coerente com a urgência classificada; cinco campos, uma linha cada, 12 a 30 palavras.
+Saída é texto puro, sem markdown nem blocos de código. Todo dado veio do alerta ou do contexto; nada copiado dos exemplos; ALERTA sem causa; IMPACTO com perda × atraso e silenciosa × visível, sem repetir métrica; hipótese única, com mecanismo e derrubável por verificação concreta; ação com verbo, alvo nomeado e sem condicional; escalação com handle válido e uma condição com prazo (ou `agora`), coerente com a urgência classificada; seis campos, uma linha cada (o CHECKLIST com quatro linhas), 12 a 30 palavras.
 
 ---
 
